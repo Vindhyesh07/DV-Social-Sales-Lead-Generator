@@ -1,6 +1,6 @@
 /*****************************************************************
  * DV SOCIAL — GOOGLE BUSINESS INTELLIGENCE ENGINE
- * VERSION 3.1 — HARDENED DAILY DISCOVERY + REFRESH
+ * VERSION 3.2 — DASHBOARD + ONE-CLICK DISCOVERY + F&B CROSS-VERIFY
  *
  * PURPOSE:
  * Internal lead discovery system for DV Social.
@@ -18,6 +18,8 @@
  * Coverage intelligence
  * Search rotation with priority scoring
  * Daily automation: new-lead discovery AND existing-lead refresh
+ * One-click DASHBOARD controls
+ * Best-effort F&B cross-verification against Zomato/Swiggy public pages
  *
  * WHAT CHANGED IN 3.1
  * - Setup is idempotent: CONTROL and SEARCH QUEUE are never wiped
@@ -43,6 +45,47 @@
  * - Column lookups go through colOf_()/idxOf_() driven by the
  *   header list instead of magic numbers.
  *
+ * WHAT CHANGED IN 3.2
+ * - DASHBOARD sheet with live metrics and three one-click checkbox
+ *   controls: Generate Fresh Leads, Refresh Existing Data, Verify F&B.
+ * - "Generate Fresh Leads" now runs ONLY new-lead discovery. Earlier
+ *   drafts routed it through the full daily pipeline (discovery +
+ *   refresh), so clicking it silently re-ran the refresh pass too —
+ *   each dashboard button now does exactly what it says, and you can
+ *   run them independently without hidden overlap.
+ * - F&B cross-verification against Zomato/Swiggy public search pages
+ *   is manual-only (menu + dashboard button) — it is deliberately NOT
+ *   wired into the automated daily trigger. Scripted fetches against
+ *   a competitor's site are very likely restricted by their Terms of
+ *   Service even without any CAPTCHA/login/proxy bypass; keeping this
+ *   an explicit, low-volume, human-triggered action (rather than
+ *   silent unattended daily automation) keeps that exposure bounded
+ *   and visible. Treat this as a business/legal decision, not just a
+ *   technical one — read the note above verifyFnbLeads_() before
+ *   turning this on for real use.
+ * - Verification honesty hardened: any non-2xx HTTP response (a 404
+ *   from a stale/guessed URL included — this previously fell through
+ *   to a confident "NOT FOUND", exactly the kind of fabricated
+ *   certainty the design is supposed to avoid) and any recognizable
+ *   bot-challenge page now report MANUAL CHECK / BLOCKED instead of a
+ *   false negative. Fuzzy name matching now requires a real substring
+ *   match for MATCH; loose token overlap alone can only produce a
+ *   lower-confidence POSSIBLE MATCH — common short words (their/the/
+ *   cafe/kitchen) could otherwise "match" almost any page. The
+ *   locality substring check was removed from the confidence score
+ *   entirely because the search query embeds the locality string, so
+ *   it nearly always echoes back regardless of whether a real listing
+ *   exists.
+ * - F&B leads that come back clean "not found on either platform" are
+ *   now re-eligible for a re-check after a cooldown instead of being
+ *   permanently skipped — a restaurant discovered today may onboard
+ *   to Zomato/Swiggy weeks later. Tracked via a new "F&B Last
+ *   Verified" column.
+ * - Dashboard adds an "Active Leads" metric (excludes CLOSED / NOT
+ *   FOUND) alongside raw "Total Leads" so the top-line number isn't
+ *   inflated by dead leads.
+ * - Fixed a duplicated refreshDashboard() call left over in setup.
+ *
  *****************************************************************/
 
 
@@ -52,7 +95,7 @@
 
 const DV3 = {
 
-  VERSION: '3.1',
+  VERSION: '3.2',
 
   ENDPOINT: 'https://places.googleapis.com/v1/places:searchText',
   DETAILS_ENDPOINT: 'https://places.googleapis.com/v1/places/',
@@ -64,6 +107,8 @@ const DV3 = {
     COVERAGE: 'COVERAGE',
     LOG: 'RUN LOG',
     RAW: 'RAW DATA',
+    DASHBOARD: 'DASHBOARD',
+    FNB_VERIFY: 'F&B VERIFY',
     FNB: 'Food & Hospitality',
     FASHION: 'Fashion & Retail',
     BEAUTY: 'Beauty & Wellness',
@@ -92,6 +137,13 @@ const DV3 = {
   // that so a run always finishes cleanly, logs, and releases its lock.
   MAX_RUN_MS: 4.5 * 60 * 1000,
   MIN_REFRESH_RESERVE_MS: 60 * 1000,
+
+  DEFAULT_FNB_VERIFY_PER_RUN: 25,
+  FNB_RECHECK_COOLDOWN_MS: 21 * 24 * 60 * 60 * 1000, // re-check a clean "not found" after 21 days
+
+  DASHBOARD_RUN_CELL: 'B3',
+  DASHBOARD_REFRESH_CELL: 'D3',
+  DASHBOARD_VERIFY_CELL: 'F3',
 
   /**
    * IMPORTANT: Google billing depends on requested fields.
@@ -145,7 +197,7 @@ const DV3 = {
     'Contactability Score', 'Zomato Found', 'Zomato URL', 'Zomato Status',
     'Swiggy Found', 'Swiggy URL', 'Swiggy Status', 'F&B Verification', 'LinkedIn',
     'Instagram', 'Facebook', 'Email', 'Sales Status', 'Assigned To', 'Notes',
-    'Last Refreshed'
+    'Last Refreshed', 'F&B Last Verified'
   ],
 
   QUEUE_HEADERS: [
@@ -247,12 +299,16 @@ function onOpen() {
     .addItem('Test API', 'testPlacesAPI')
     .addSeparator()
     .addItem('Update Search Queue (Add New Categories)', 'generateSearchQueue')
+    .addItem('Generate Fresh Leads', 'generateFreshLeads')
     .addItem('Run Daily Discovery', 'runDailyDiscovery')
     .addItem('Run Next 10 Searches', 'runNext10Searches')
     .addItem('Refresh Existing Leads Now', 'refreshExistingLeadsNow')
+    .addItem('Verify F&B on Zomato + Swiggy', 'verifyFnbNow')
     .addSeparator()
     .addItem('Refresh Category Views', 'refreshCategoryViews')
     .addItem('Refresh Coverage', 'refreshCoverage')
+    .addItem('Refresh Dashboard', 'refreshDashboard')
+    .addItem('Open Dashboard', 'goToDashboard')
     .addSeparator()
     .addItem('Enable Daily Automation', 'enableDailyAutomation')
     .addItem('Disable Daily Automation', 'disableDailyAutomation')
@@ -279,6 +335,9 @@ function setupV3() {
   createLogSheet_(ss);
   createRawSheet_(ss);
   createCategorySheets_(ss);
+  createFnbVerifySheet_(ss);
+  createDashboardSheet_(ss);
+  ensureDashboardEditTrigger_(ss);
 
   if (!queueSheetExisted) {
     generateSearchQueue();
@@ -287,6 +346,7 @@ function setupV3() {
   refreshCategoryViews();
   refreshCoverage();
   updateControlStats_();
+  refreshDashboard();
 
   SpreadsheetApp.getUi().alert(
     'DV GOOGLE INTELLIGENCE V3 READY\n\n' +
@@ -294,9 +354,13 @@ function setupV3() {
     '1. DV INTELLIGENCE -> Set / Update API Key\n' +
     '2. Test API\n' +
     '3. Open CONTROL and set your Daily Target\n' +
-    '4. Run Daily Discovery (or Enable Daily Automation)\n\n' +
+    '4. Run Daily Discovery (or Enable Daily Automation)\n' +
+    '5. Open DASHBOARD for one-click controls and live metrics\n\n' +
     'Safe to re-run this any time — it will never erase your\n' +
-    'CONTROL settings, search queue progress, or leads.'
+    'CONTROL settings, search queue progress, or leads.\n\n' +
+    'Note: F&B Zomato/Swiggy verification is manual-only by design\n' +
+    '(DV INTELLIGENCE -> Verify F&B) — it does not run as part of\n' +
+    'daily automation. See the code comments before relying on it.'
   );
 
 }
@@ -327,6 +391,7 @@ function createControlSheet_(ss) {
       ['Leads To Refresh Per Day', DV3.DEFAULT_LEADS_TO_REFRESH_PER_DAY],
       ['Max Raw Data Rows', DV3.DEFAULT_MAX_RAW_ROWS],
       ['Daily Automation Enabled', 'FALSE'],
+      ['F&B Leads To Verify Per Run', DV3.DEFAULT_FNB_VERIFY_PER_RUN],
       ['', ''],
       ['SYSTEM STATUS', ''],
       ['Last Discovery Run', ''],
@@ -356,6 +421,7 @@ function createControlSheet_(ss) {
   ensureControlRow_(sh, 'Max Raw Data Rows', DV3.DEFAULT_MAX_RAW_ROWS);
   ensureControlRow_(sh, 'Daily Automation Enabled', 'FALSE');
   ensureControlRow_(sh, 'Last Leads Refreshed', 0);
+  ensureControlRow_(sh, 'F&B Leads To Verify Per Run', DV3.DEFAULT_FNB_VERIFY_PER_RUN);
 
 }
 
@@ -428,6 +494,10 @@ function getMaxRawRows_() {
   return Math.max(100, Number(getControlValue_('Max Raw Data Rows')) || DV3.DEFAULT_MAX_RAW_ROWS);
 }
 
+function getFnbVerifyPerRun_() {
+  return Math.max(0, Number(getControlValue_('F&B Leads To Verify Per Run')) || DV3.DEFAULT_FNB_VERIFY_PER_RUN);
+}
+
 function getAutomationHour_() {
   const hour = Number(getControlValue_('Daily Automation Hour (0-23)'));
   if (isNaN(hour) || hour < 0 || hour > 23) return 7;
@@ -445,6 +515,7 @@ function createMasterSheet_(ss) {
 
   if (sh.getLastRow() > 1) {
     ensureHeaderColumn_(sh, 'Last Refreshed');
+    ensureHeaderColumn_(sh, 'F&B Last Verified');
     return;
   }
 
@@ -595,8 +666,77 @@ function calculateQueryPriority_(group, category, locality) {
 
 
 /*****************************************************************
+ * GENERATE FRESH LEADS (manual, one-click — discovery only)
+ * Deliberately does NOT also refresh existing leads or verify F&B —
+ * those are separate one-click actions. Earlier drafts routed this
+ * through the full daily pipeline, so clicking "Generate Fresh
+ * Leads" silently re-ran the refresh pass too; each dashboard/menu
+ * action now does exactly what it says on the label.
+ *****************************************************************/
+
+function generateFreshLeads() {
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+
+  const started = new Date();
+
+  try {
+
+    const apiKey = getPlacesAPIKey_();
+
+    if (!apiKey) {
+      SpreadsheetApp.getUi().alert('Set your Google Places API key first (DV INTELLIGENCE -> Set / Update API Key).');
+      return;
+    }
+
+    const target = getDailyTarget_();
+    const budget = { remaining: getMaxApiCallsPerRun_() };
+    const deadline = started.getTime() + DV3.MAX_RUN_MS;
+
+    const result = runDiscoveryBatch_(target, Infinity, budget, deadline);
+
+    refreshCategoryViews();
+    refreshCoverage();
+    updateControlStats_();
+    refreshDashboard();
+
+    setControlValue_('Last Discovery Run', new Date());
+    setControlValue_('Last New Leads', result.newLeads);
+
+    const seconds = ((new Date() - started) / 1000).toFixed(2);
+
+    logSystemRun_('MANUAL DISCOVERY', result.searchesRun, result.apiResults, result.newLeads, result.duplicates, seconds, 'SUCCESS', 'Target: ' + target);
+
+    SpreadsheetApp.getUi().alert(
+      'NEW LEADS COMPLETE\n\n' +
+      'Target: ' + target +
+      '\nNew Leads: ' + result.newLeads +
+      '\nSearches Run: ' + result.searchesRun +
+      '\nAPI Results: ' + result.apiResults +
+      '\nDuplicates: ' + result.duplicates +
+      '\n\nTime: ' + seconds + ' sec'
+    );
+
+  } catch (error) {
+
+    logSystemRun_('MANUAL DISCOVERY', 0, 0, 0, 0, 0, 'ERROR', error.message);
+    try { SpreadsheetApp.getUi().alert('ERROR\n\n' + error.message); } catch (e) {}
+
+  } finally {
+
+    lock.releaseLock();
+
+  }
+
+}
+
+
+/*****************************************************************
  * RUN DAILY DISCOVERY (new leads + existing-lead refresh, in one
- * time- and budget-bounded run)
+ * time- and budget-bounded run — this is what the daily automation
+ * trigger calls. F&B verification is intentionally NOT part of this
+ * automatic pipeline; see the note above verifyFnbLeads_().)
  *****************************************************************/
 
 function runDailyDiscovery() {
@@ -625,6 +765,7 @@ function runDailyDiscovery() {
     refreshCategoryViews();
     refreshCoverage();
     updateControlStats_();
+    refreshDashboard();
 
     setControlValue_('Last Discovery Run', new Date());
     setControlValue_('Last New Leads', discoveryResult.newLeads);
@@ -888,7 +1029,7 @@ function placeToLeadRow_(place, group, category, locality, query) {
     extractOpeningHours_(place), query, now, now, score, priority, contactability,
     isFNB ? 'NOT CHECKED' : 'N/A', '', isFNB ? 'PENDING' : 'N/A',
     isFNB ? 'NOT CHECKED' : 'N/A', '', isFNB ? 'PENDING' : 'N/A',
-    isFNB ? 'PENDING' : 'N/A', '', '', '', '', 'NEW', '', '', now
+    isFNB ? 'PENDING' : 'N/A', '', '', '', '', 'NEW', '', '', now, ''
   ];
 
 }
@@ -1056,6 +1197,11 @@ function refreshExistingLeadsNow() {
     const deadline = new Date().getTime() + DV3.MAX_RUN_MS;
 
     const result = refreshExistingLeads_(budget, deadline);
+
+    refreshCoverage();
+    updateControlStats_();
+    refreshDashboard();
+    setControlValue_('Last Leads Refreshed', result.updated);
 
     SpreadsheetApp.getUi().alert(
       'LEAD REFRESH COMPLETE\n\n' +
@@ -1687,4 +1833,432 @@ function getOrCreateSheet_(ss, name) {
 
   return sh;
 
+}
+
+
+/*****************************************************************
+ * DASHBOARD + ONE-CLICK CONTROLS
+ *****************************************************************/
+
+function createDashboardSheet_(ss) {
+
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.DASHBOARD);
+
+  if (sh.getLastRow() > 0) return;
+
+  sh.getRange('A1:I1').merge().setValue('DV SOCIAL — SALES LEAD DASHBOARD')
+    .setFontSize(20).setFontWeight('bold').setHorizontalAlignment('center');
+
+  sh.getRange('A3').setValue('GENERATE FRESH LEADS');
+  sh.getRange(DV3.DASHBOARD_RUN_CELL).insertCheckboxes().setValue(false);
+
+  sh.getRange('C3').setValue('REFRESH EXISTING DATA');
+  sh.getRange(DV3.DASHBOARD_REFRESH_CELL).insertCheckboxes().setValue(false);
+
+  sh.getRange('E3').setValue('VERIFY F&B');
+  sh.getRange(DV3.DASHBOARD_VERIFY_CELL).insertCheckboxes().setValue(false);
+
+  sh.getRange('A5:I5').setValues([[
+    'Total Leads', 'Active Leads', 'New Today', 'Phone Available', 'Website Available',
+    'HOT', 'HIGH', 'Refreshed Today', 'F&B Verified'
+  ]]).setFontWeight('bold');
+
+  sh.getRange('A8:D8').setValues([['Category', 'Total', 'With Phone', 'HOT + HIGH']]).setFontWeight('bold');
+  sh.getRange('F8:H8').setValues([['Locality', 'Total', 'New Today']]).setFontWeight('bold');
+
+  sh.setFrozenRows(3);
+  sh.setColumnWidths(1, 9, 145);
+
+}
+
+
+function refreshDashboard() {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.DASHBOARD);
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+
+  if (!sh || !master) return;
+
+  const data = master.getLastRow() > 1
+    ? master.getRange(2, 1, master.getLastRow() - 1, DV3.MASTER_HEADERS.length).getValues()
+    : [];
+
+  const idx = function(name) { return idxOf_(name); };
+  const today = new Date();
+  const dayKey = Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  const sameDay = function(v) {
+    if (!v) return false;
+    try { return Utilities.formatDate(new Date(v), Session.getScriptTimeZone(), 'yyyy-MM-dd') === dayKey; }
+    catch (e) { return false; }
+  };
+
+  let total = data.length, active = 0, newToday = 0, phone = 0, website = 0,
+    hot = 0, high = 0, refreshedToday = 0, fnbVerified = 0;
+
+  const cats = {}, locs = {};
+
+  data.forEach(function(r) {
+
+    const salesStatus = r[idx('Sales Status')];
+    const businessStatus = r[idx('Business Status')];
+    const isDead = salesStatus === 'CLOSED' || businessStatus === 'CLOSED_PERMANENTLY' ||
+      businessStatus === 'CLOSED_TEMPORARILY' || businessStatus === 'NOT FOUND';
+
+    if (!isDead) active++;
+
+    if (sameDay(r[idx('First Discovered')])) newToday++;
+    if (r[idx('Phone')]) phone++;
+    if (r[idx('Website')]) website++;
+    if (r[idx('Lead Priority')] === 'HOT') hot++;
+    if (r[idx('Lead Priority')] === 'HIGH') high++;
+    if (sameDay(r[idx('Last Refreshed')])) refreshedToday++;
+    if (r[idx('F&B Verification')] === 'VERIFIED BOTH' || r[idx('F&B Verification')] === 'VERIFIED ONE') fnbVerified++;
+
+    const c = String(r[idx('DV Category')] || 'Other');
+    if (!cats[c]) cats[c] = { total: 0, phone: 0, strong: 0 };
+    cats[c].total++;
+    if (r[idx('Phone')]) cats[c].phone++;
+    if (r[idx('Lead Priority')] === 'HOT' || r[idx('Lead Priority')] === 'HIGH') cats[c].strong++;
+
+    const l = String(r[idx('Search Locality')] || 'Unknown');
+    if (!locs[l]) locs[l] = { total: 0, today: 0 };
+    locs[l].total++;
+    if (sameDay(r[idx('First Discovered')])) locs[l].today++;
+
+  });
+
+  sh.getRange('A6:I6').setValues([[total, active, newToday, phone, website, hot, high, refreshedToday, fnbVerified]]);
+
+  const catRows = Object.keys(cats).map(function(k) { return [k, cats[k].total, cats[k].phone, cats[k].strong]; })
+    .sort(function(a, b) { return b[1] - a[1]; }).slice(0, 20);
+
+  const locRows = Object.keys(locs).map(function(k) { return [k, locs[k].total, locs[k].today]; })
+    .sort(function(a, b) { return b[1] - a[1]; }).slice(0, 20);
+
+  sh.getRange('A9:D40').clearContent();
+  sh.getRange('F9:H40').clearContent();
+
+  if (catRows.length) sh.getRange(9, 1, catRows.length, 4).setValues(catRows);
+  if (locRows.length) sh.getRange(9, 6, locRows.length, 3).setValues(locRows);
+
+}
+
+
+function goToDashboard() {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.DASHBOARD);
+
+  if (sh) ss.setActiveSheet(sh);
+
+}
+
+
+function dashboardButtonHandler(e) {
+
+  try {
+
+    if (!e || !e.range) return;
+
+    const sh = e.range.getSheet();
+    if (sh.getName() !== DV3.SHEETS.DASHBOARD || e.value !== 'TRUE') return;
+
+    const a1 = e.range.getA1Notation();
+    e.range.setValue(false);
+
+    if (a1 === DV3.DASHBOARD_RUN_CELL) generateFreshLeads();
+    else if (a1 === DV3.DASHBOARD_REFRESH_CELL) refreshExistingLeadsNow();
+    else if (a1 === DV3.DASHBOARD_VERIFY_CELL) verifyFnbNow();
+
+  } catch (err) {
+
+    console.log(err);
+
+  }
+
+}
+
+
+function ensureDashboardEditTrigger_(ss) {
+
+  const handler = 'dashboardButtonHandler';
+
+  const exists = ScriptApp.getProjectTriggers().some(function(t) {
+    return t.getHandlerFunction() === handler;
+  });
+
+  if (!exists) {
+    ScriptApp.newTrigger(handler).forSpreadsheet(ss).onEdit().create();
+  }
+
+}
+
+
+/*****************************************************************
+ * F&B ZOMATO / SWIGGY CROSS-VERIFICATION
+ *
+ * Best-effort public-page checking only. No login, CAPTCHA bypass,
+ * proxy rotation, anti-bot evasion, or restricted-endpoint access.
+ *
+ * IMPORTANT — read before enabling routine use:
+ * This fetches pages from zomato.com and swiggy.com with a scripted
+ * HTTP client. Even with no bypass techniques involved, that is very
+ * likely restricted by both platforms' Terms of Service. This is why
+ * it is a manual, explicitly human-triggered action (menu button /
+ * dashboard checkbox) and is NOT wired into the automated daily
+ * trigger. Keep usage low-volume and treat every result as a lead to
+ * double-check, not a verified fact — the confidence levels below
+ * are deliberately conservative because Zomato/Swiggy search results
+ * are largely client-rendered, so a scripted fetch usually only sees
+ * an application shell, not the actual listing data. If your team
+ * needs reliable F&B presence data at scale, an official partner
+ * integration is the correct long-term answer, not more scraping.
+ *****************************************************************/
+
+function createFnbVerifySheet_(ss) {
+
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.FNB_VERIFY);
+
+  if (sh.getLastRow() > 0) return;
+
+  sh.getRange(1, 1, 1, 10).setValues([[
+    'Timestamp', 'DV Lead ID', 'Business Name', 'Locality', 'Source', 'Search URL',
+    'HTTP Status', 'Match Result', 'Confidence', 'Note'
+  ]]).setFontWeight('bold');
+
+  sh.setFrozenRows(1);
+
+}
+
+
+function verifyFnbNow() {
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+
+  try {
+
+    const deadline = Date.now() + DV3.MAX_RUN_MS;
+    const result = verifyFnbLeads_(getFnbVerifyPerRun_(), deadline);
+
+    refreshDashboard();
+
+    SpreadsheetApp.getUi().alert(
+      'F&B VERIFICATION COMPLETE\n\nChecked: ' + result.checked +
+      '\nVerified both: ' + result.both +
+      '\nVerified one: ' + result.one +
+      '\nManual/blocked: ' + result.manual
+    );
+
+  } finally {
+
+    lock.releaseLock();
+
+  }
+
+}
+
+
+function verifyFnbLeads_(limit, deadline) {
+
+  const ss = SpreadsheetApp.getActive();
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+  const logSh = ss.getSheetByName(DV3.SHEETS.FNB_VERIFY);
+
+  const stats = { checked: 0, both: 0, one: 0, manual: 0 };
+
+  if (!master || master.getLastRow() <= 1 || limit <= 0) return stats;
+
+  const data = master.getRange(2, 1, master.getLastRow() - 1, DV3.MASTER_HEADERS.length).getValues();
+
+  const groupI = idxOf_('Main Group');
+  const statusI = idxOf_('F&B Verification');
+  const lastVerifiedI = idxOf_('F&B Last Verified');
+  const nameI = idxOf_('Business Name');
+  const locI = idxOf_('Search Locality');
+  const idI = idxOf_('DV Lead ID');
+
+  for (let i = 0; i < data.length && stats.checked < limit; i++) {
+
+    if (Date.now() >= deadline) break;
+
+    const r = data[i];
+
+    if (r[groupI] !== 'Food & Hospitality') continue;
+
+    const status = r[statusI];
+    const lastVerified = r[lastVerifiedI] ? new Date(r[lastVerifiedI]).getTime() : 0;
+    const cooledDown = (Date.now() - lastVerified) > DV3.FNB_RECHECK_COOLDOWN_MS;
+
+    // A lead that came back clean "not found anywhere" is eligible again
+    // after the cooldown — a restaurant can join Zomato/Swiggy later.
+    const eligible = !status || status === 'PENDING' || status === 'NOT CHECKED' ||
+      (status === 'NOT VERIFIED' && cooledDown);
+
+    if (!eligible) continue;
+
+    const name = String(r[nameI] || '').trim();
+    const locality = String(r[locI] || '').trim();
+
+    if (!name) continue;
+
+    const z = verifyOnPlatform_('ZOMATO', name, locality);
+    Utilities.sleep(300);
+    const s = verifyOnPlatform_('SWIGGY', name, locality);
+
+    const row = i + 2;
+
+    master.getRange(row, colOf_('Zomato Found')).setValue(z.found ? 'YES' : (z.manual ? 'MANUAL' : 'NO'));
+    master.getRange(row, colOf_('Zomato URL')).setValue(z.url);
+    master.getRange(row, colOf_('Zomato Status')).setValue(z.status);
+    master.getRange(row, colOf_('Swiggy Found')).setValue(s.found ? 'YES' : (s.manual ? 'MANUAL' : 'NO'));
+    master.getRange(row, colOf_('Swiggy URL')).setValue(s.url);
+    master.getRange(row, colOf_('Swiggy Status')).setValue(s.status);
+
+    let finalStatus = 'NOT VERIFIED';
+
+    if (z.found && s.found) { finalStatus = 'VERIFIED BOTH'; stats.both++; }
+    else if (z.found || s.found) { finalStatus = 'VERIFIED ONE'; stats.one++; }
+    else if (z.manual || s.manual) { finalStatus = 'MANUAL CHECK'; stats.manual++; }
+
+    master.getRange(row, colOf_('F&B Verification')).setValue(finalStatus);
+    master.getRange(row, colOf_('F&B Last Verified')).setValue(new Date());
+
+    const now = new Date();
+
+    [z, s].forEach(function(v) {
+      logSh.appendRow([now, r[idI], name, locality, v.source, v.url, v.httpStatus, v.status, v.confidence, v.note]);
+    });
+
+    stats.checked++;
+    Utilities.sleep(300);
+
+  }
+
+  return stats;
+
+}
+
+
+/*****************************************************************
+ * A single platform check. Deliberately conservative:
+ * - Any non-2xx response (including 404s from a stale/guessed
+ *   search URL) is inconclusive, never a confident "not found".
+ * - Recognizable bot-challenge / interstitial pages are BLOCKED.
+ * - A real listing needs the normalized business name to appear as
+ *   a literal substring for MATCH. Loose token overlap on its own
+ *   downgrades to POSSIBLE MATCH — common short words (cafe, the,
+ *   kitchen, restaurant) can otherwise "match" almost any page.
+ * - Locality is not scored into confidence at all: the search query
+ *   itself contains the locality string, so it nearly always echoes
+ *   back in the page regardless of whether a real listing exists.
+ *****************************************************************/
+
+function verifyOnPlatform_(source, businessName, locality) {
+
+  const q = encodeURIComponent(businessName + ' ' + locality + ' Hyderabad');
+  const isZ = source === 'ZOMATO';
+
+  const url = isZ
+    ? 'https://www.zomato.com/hyderabad/restaurants?q=' + q
+    : 'https://www.swiggy.com/search?query=' + q;
+
+  const result = {
+    source: source, url: url, found: false, manual: false,
+    httpStatus: '', status: 'NOT FOUND', confidence: 0, note: ''
+  };
+
+  try {
+
+    const resp = UrlFetchApp.fetch(url, {
+      method: 'get', muteHttpExceptions: true, followRedirects: true,
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; DVSocialInternalResearch/1.0)' }
+    });
+
+    const code = resp.getResponseCode();
+    const html = resp.getContentText() || '';
+    result.httpStatus = code;
+
+    // Any non-2xx (404 included) is inconclusive — never report a
+    // confident "not found" off a request that didn't actually succeed.
+    if (code < 200 || code >= 300) {
+      result.manual = true;
+      result.status = (code === 401 || code === 403 || code === 429) ? 'BLOCKED / MANUAL' : 'MANUAL CHECK';
+      result.note = 'Non-2xx response (' + code + '); public fetch not reliably usable, no bypass attempted.';
+      return result;
+    }
+
+    const body = normalizeText_(html);
+
+    if (looksLikeBotChallenge_(body)) {
+      result.manual = true;
+      result.status = 'BLOCKED / MANUAL';
+      result.note = 'Response looks like a bot-challenge / interstitial page.';
+      return result;
+    }
+
+    const nameN = normalizeText_(businessName);
+    const exactHit = nameN && body.indexOf(nameN) !== -1;
+    const fuzzyHit = !exactHit && fuzzyContains_(body, nameN);
+
+    if (exactHit) {
+      result.found = true;
+      result.status = 'MATCH';
+      result.confidence = 70;
+    } else if (fuzzyHit) {
+      result.found = true;
+      result.status = 'POSSIBLE MATCH';
+      result.confidence = 35;
+      result.note = 'Partial name-token overlap only — verify manually before treating as confirmed.';
+    } else if (html.length < 5000) {
+      result.manual = true;
+      result.status = 'MANUAL CHECK';
+      result.note = 'Page appears client-rendered or incomplete.';
+    }
+
+  } catch (e) {
+
+    result.manual = true;
+    result.status = 'MANUAL CHECK';
+    result.note = String(e.message || e);
+
+  }
+
+  return result;
+
+}
+
+
+function looksLikeBotChallenge_(normalizedBody) {
+
+  const markers = [
+    'just a moment', 'checking your browser', 'cf browser verification',
+    'access denied', 'are you a robot', 'enable javascript and cookies',
+    'unusual traffic'
+  ];
+
+  return markers.some(function(m) { return normalizedBody.indexOf(m) !== -1; });
+
+}
+
+
+function normalizeText_(s) {
+  return String(s || '').toLowerCase().replace(/&amp;/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+
+function fuzzyContains_(body, name) {
+
+  if (!name || !body) return false;
+
+  const tokens = name.split(' ').filter(function(t) { return t.length >= 4; });
+  if (!tokens.length) return false;
+
+  let hits = 0;
+  tokens.forEach(function(t) { if (body.indexOf(t) !== -1) hits++; });
+
+  return hits === tokens.length; // every distinctive token must appear
 }
