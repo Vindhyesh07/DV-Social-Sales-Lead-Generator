@@ -1,75 +1,109 @@
-/***************************************************************
- * DV SOCIAL — SALES INTELLIGENCE ENGINE
- * VERSION 2.0 — DAILY AUTO-REFINEMENT
+/*****************************************************************
+ * DV SOCIAL — GOOGLE BUSINESS INTELLIGENCE ENGINE
+ * VERSION 3.1 — HARDENED DAILY DISCOVERY + REFRESH
  *
- * Stack:
+ * PURPOSE:
+ * Internal lead discovery system for DV Social.
+ *
+ * STACK:
  * Google Sheets
  * Google Apps Script
  * Google Places API (New) — Text Search + Place Details
  *
- * -------------------------------------------------------------
- * WHAT'S NEW IN V2
- * - SEARCH QUEUE sheet: queue up many searches (not just one) to
- *   run automatically every day, instead of one manual query.
- * - Daily Auto-Refinement trigger: once a day, runs the active
- *   queue AND re-checks your oldest existing leads against Place
- *   Details so rating / reviews / phone / website / open-closed
- *   status stay current instead of going stale.
- * - Leads whose business has closed are automatically flagged
- *   CLOSED (unless you've already moved them into your own
- *   pipeline stage), and lead scores fall to 0 for permanently
- *   closed businesses so dead leads stop ranking as "hot".
- * - API key can be moved out of the sheet into Script Properties
- *   (DV LEADS → Save API Key Securely) so it isn't sitting in
- *   plain text for anyone with view access to the sheet.
- * - "Setup / Update System" is now safe to re-run — it no longer
- *   wipes existing leads, raw data, run log, or settings.
- * - Retries with backoff on transient API errors, and leads are
- *   written to the sheet page-by-page instead of only at the very
- *   end, so a failure mid-search doesn't lose everything found
- *   so far.
- * - RAW DATA sheet is auto-trimmed so it doesn't grow forever.
- * - Realistic pagination cap (3 pages / 60 results per query) —
- *   this is a hard ceiling on Google's side, not a bug.
+ * CORE:
+ * Category x Locality search matrix
+ * 100-500 new leads/day target, budget- and time-bounded
+ * Place-ID deduplication
+ * Live category views (QUERY formulas, never overwrite edits)
+ * Coverage intelligence
+ * Search rotation with priority scoring
+ * Daily automation: new-lead discovery AND existing-lead refresh
  *
- * -------------------------------------------------------------
- * SHEETS:
- * 1. SEARCH        — single manual query
- * 2. SEARCH QUEUE   — many queries, run daily
- * 3. LEADS
- * 4. RAW DATA
- * 5. RUN LOG
- * 6. SETTINGS
+ * WHAT CHANGED IN 3.1
+ * - Setup is idempotent: CONTROL and SEARCH QUEUE are never wiped
+ *   by re-running "Setup V3 System".
+ * - Fixed a crash when running discovery against an empty queue.
+ * - Added a hard per-run API-call budget and execution-time budget
+ *   shared across discovery and refresh, so a run can't blow past
+ *   Apps Script's execution limit or spend unbounded API quota
+ *   chasing a target across low-yield niche searches.
+ * - "Run Next 10 Searches" now checks the API key and takes the
+ *   same lock as the daily run.
+ * - Category tabs (Food & Hospitality, Fashion & Retail, ...) are
+ *   now live QUERY() formulas against MASTER DATABASE instead of
+ *   static clear+rewrite copies. Editing Sales Status / Notes /
+ *   Assigned To directly in a category tab used to get silently
+ *   wiped on the next refresh — now there's nothing to edit there,
+ *   so do that editing in MASTER DATABASE (use its column filter
+ *   to view one category at a time).
+ * - Added a daily "refresh existing leads" pass (Place Details)
+ *   so rating / reviews / phone / website / open-closed status
+ *   stay current instead of only growing new leads.
+ * - RAW DATA now auto-trims instead of growing forever.
+ * - Column lookups go through colOf_()/idxOf_() driven by the
+ *   header list instead of magic numbers.
  *
- ***************************************************************/
+ *****************************************************************/
 
 
-const DV = {
+/*****************************************************************
+ * CONFIG
+ *****************************************************************/
 
-  SHEETS: {
-    SEARCH: 'SEARCH',
-    QUEUE: 'SEARCH QUEUE',
-    LEADS: 'LEADS',
-    RAW: 'RAW DATA',
-    LOG: 'RUN LOG',
-    SETTINGS: 'SETTINGS'
-  },
+const DV3 = {
 
-  SEARCH_ENDPOINT: 'https://places.googleapis.com/v1/places:searchText',
+  VERSION: '3.1',
+
+  ENDPOINT: 'https://places.googleapis.com/v1/places:searchText',
   DETAILS_ENDPOINT: 'https://places.googleapis.com/v1/places/',
 
-  // Google Places Text Search hard-caps results at 3 pages of 20 (60 total)
-  // per query. Requesting more pages just returns an empty nextPageToken.
-  HARD_MAX_PAGES: 3,
+  SHEETS: {
+    CONTROL: 'CONTROL',
+    MASTER: 'MASTER DATABASE',
+    QUEUE: 'SEARCH QUEUE',
+    COVERAGE: 'COVERAGE',
+    LOG: 'RUN LOG',
+    RAW: 'RAW DATA',
+    FNB: 'Food & Hospitality',
+    FASHION: 'Fashion & Retail',
+    BEAUTY: 'Beauty & Wellness',
+    REAL_ESTATE: 'Real Estate',
+    HEALTHCARE: 'Healthcare',
+    EDUCATION: 'Education',
+    AUTOMOTIVE: 'Automotive',
+    OTHER: 'Other'
+  },
 
   API_KEY_PROPERTY: 'DV_PLACES_API_KEY',
-  DAILY_TRIGGER_HANDLER: 'runDailyRefinement',
+  DAILY_TRIGGER_HANDLER: 'runDailyDiscovery',
 
-  SEARCH_FIELD_MASK: [
+  DEFAULT_DAILY_TARGET: 250,
+  MAX_DAILY_TARGET: 500,
+  DEFAULT_MAX_API_CALLS_PER_RUN: 400,
+  DEFAULT_LEADS_TO_REFRESH_PER_DAY: 100,
+  DEFAULT_MAX_RAW_ROWS: 20000,
+
+  MAX_PAGES_PER_QUERY: 3,
+  PAGE_SIZE: 20,
+  API_RETRIES: 3,
+  WRITE_BATCH_SIZE: 50,
+
+  // Apps Script kills executions around 6 minutes. Stay well clear of
+  // that so a run always finishes cleanly, logs, and releases its lock.
+  MAX_RUN_MS: 4.5 * 60 * 1000,
+  MIN_REFRESH_RESERVE_MS: 60 * 1000,
+
+  /**
+   * IMPORTANT: Google billing depends on requested fields.
+   * We deliberately request only the fields sales actually uses.
+   */
+  FIELD_MASK: [
     'places.id',
     'places.displayName',
     'places.formattedAddress',
+    'places.primaryType',
     'places.primaryTypeDisplayName',
+    'places.types',
     'places.location',
     'places.googleMapsUri',
     'places.businessStatus',
@@ -87,7 +121,9 @@ const DV = {
     'id',
     'displayName',
     'formattedAddress',
+    'primaryType',
     'primaryTypeDisplayName',
+    'types',
     'location',
     'googleMapsUri',
     'businessStatus',
@@ -100,286 +136,234 @@ const DV = {
     'regularOpeningHours'
   ].join(','),
 
-  LEADS_HEADERS: [
-    'Lead ID', 'Business Name', 'Category', 'Address', 'City / Search Location',
-    'Phone', 'International Phone', 'Website', 'Rating', 'Review Count',
-    'Price Level', 'Google Maps URL', 'Google Place ID', 'Latitude', 'Longitude',
-    'Business Status', 'Opening Hours', 'Search Query', 'Date Discovered',
-    'Lead Score', 'Status', 'Notes', 'Last Refreshed'
+  MASTER_HEADERS: [
+    'DV Lead ID', 'Business Name', 'Main Group', 'DV Category', 'Google Category',
+    'Google Types', 'Search Locality', 'Address', 'Phone', 'International Phone',
+    'Website', 'Google Rating', 'Google Reviews', 'Price Level', 'Google Maps URL',
+    'Google Place ID', 'Latitude', 'Longitude', 'Business Status', 'Opening Hours',
+    'Search Query', 'First Discovered', 'Last Updated', 'Lead Score', 'Lead Priority',
+    'Contactability Score', 'Zomato Found', 'Zomato URL', 'Zomato Status',
+    'Swiggy Found', 'Swiggy URL', 'Swiggy Status', 'F&B Verification', 'LinkedIn',
+    'Instagram', 'Facebook', 'Email', 'Sales Status', 'Assigned To', 'Notes',
+    'Last Refreshed'
   ],
 
-  LOG_HEADERS: [
-    'Timestamp', 'Search Query', 'API Results', 'Passed Filters', 'New Leads',
-    'Duplicates', 'Rejected Rating', 'Rejected Reviews', 'Execution Time (Sec)',
-    'Status', 'Message', 'Run Type'
-  ]
+  QUEUE_HEADERS: [
+    'Queue ID', 'Main Group', 'Category', 'Keyword', 'Locality', 'Full Query',
+    'Priority', 'Status', 'Last Run', 'API Results', 'New Leads', 'Duplicates',
+    'Run Count'
+  ],
+
+  RAW_HEADERS: ['Timestamp', 'Query', 'Group', 'Category', 'Locality', 'Place ID', 'Raw JSON'],
+
+  LOG_HEADERS: ['Timestamp', 'Run Type', 'Searches', 'API Results', 'New Leads', 'Duplicates', 'Execution Seconds', 'Status', 'Message']
 
 };
 
 
-/***************************************************************
+/*****************************************************************
+ * CATEGORY TAXONOMY
+ *****************************************************************/
+
+const DV_CATEGORIES = [
+
+  { group: 'Food & Hospitality', category: 'Restaurants', queries: ['restaurants', 'popular restaurants', 'premium restaurants'] },
+  { group: 'Food & Hospitality', category: 'Cafes', queries: ['cafes', 'coffee shops', 'premium cafes'] },
+  { group: 'Food & Hospitality', category: 'Cloud Kitchens', queries: ['cloud kitchens', 'delivery kitchens', 'ghost kitchens'] },
+  { group: 'Food & Hospitality', category: 'Bakeries', queries: ['bakeries', 'cake shops', 'premium bakeries'] },
+  { group: 'Food & Hospitality', category: 'Fine Dining', queries: ['fine dining restaurants', 'luxury restaurants'] },
+  { group: 'Food & Hospitality', category: 'QSR', queries: ['quick service restaurants', 'fast food restaurants'] },
+  { group: 'Food & Hospitality', category: 'Desserts & Sweets', queries: ['dessert shops', 'sweet shops', 'ice cream shops'] },
+  { group: 'Food & Hospitality', category: 'Bars & Pubs', queries: ['bars', 'pubs', 'lounges'] },
+  { group: 'Food & Hospitality', category: 'Hotels', queries: ['hotels', 'luxury hotels', 'boutique hotels'] },
+  { group: 'Food & Hospitality', category: 'Resorts', queries: ['resorts', 'luxury resorts'] },
+  { group: 'Food & Hospitality', category: 'Catering', queries: ['catering companies', 'event caterers'] },
+
+  { group: 'Fashion & Retail', category: 'Clothing Brands', queries: ['clothing stores', 'fashion brands', 'clothing brands'] },
+  { group: 'Fashion & Retail', category: 'Boutiques', queries: ['fashion boutiques', 'designer boutiques'] },
+  { group: 'Fashion & Retail', category: 'Designer Stores', queries: ['designer clothing stores', 'designer fashion stores'] },
+  { group: 'Fashion & Retail', category: 'Jewellery', queries: ['jewellery stores', 'jewellery brands', 'luxury jewellery'] },
+  { group: 'Fashion & Retail', category: 'Footwear', queries: ['shoe stores', 'footwear stores'] },
+  { group: 'Fashion & Retail', category: 'Lifestyle', queries: ['lifestyle stores', 'home decor stores'] },
+
+  { group: 'Beauty & Wellness', category: 'Salons', queries: ['salons', 'premium salons', 'beauty salons'] },
+  { group: 'Beauty & Wellness', category: 'Spas', queries: ['spas', 'wellness spas'] },
+  { group: 'Beauty & Wellness', category: 'Gyms', queries: ['gyms', 'fitness centres', 'premium gyms'] },
+  { group: 'Beauty & Wellness', category: 'Skin Clinics', queries: ['skin clinics', 'dermatology clinics', 'aesthetic clinics'] },
+  { group: 'Beauty & Wellness', category: 'Wellness Centres', queries: ['wellness centres', 'wellness clinics'] },
+
+  { group: 'Real Estate', category: 'Developers', queries: ['real estate developers', 'property developers'] },
+  { group: 'Real Estate', category: 'Builders', queries: ['builders', 'construction companies'] },
+  { group: 'Real Estate', category: 'Interior Designers', queries: ['interior designers', 'interior design studios'] },
+  { group: 'Real Estate', category: 'Architects', queries: ['architects', 'architecture firms'] },
+
+  { group: 'Healthcare', category: 'Hospitals', queries: ['hospitals', 'private hospitals'] },
+  { group: 'Healthcare', category: 'Dental Clinics', queries: ['dental clinics', 'dentists'] },
+  { group: 'Healthcare', category: 'Eye Hospitals', queries: ['eye hospitals', 'eye clinics'] },
+  { group: 'Healthcare', category: 'Fertility Clinics', queries: ['fertility clinics', 'IVF centres'] },
+
+  { group: 'Education', category: 'Schools', queries: ['private schools', 'international schools'] },
+  { group: 'Education', category: 'Colleges', queries: ['private colleges', 'degree colleges'] },
+  { group: 'Education', category: 'Coaching', queries: ['coaching institutes', 'training institutes'] },
+
+  { group: 'Automotive', category: 'Car Dealerships', queries: ['car dealerships', 'car showrooms'] },
+  { group: 'Automotive', category: 'Bike Dealerships', queries: ['bike dealerships', 'motorcycle showrooms'] },
+  { group: 'Automotive', category: 'Car Detailing', queries: ['car detailing', 'car detailing studios'] }
+
+];
+
+
+/*****************************************************************
+ * HYDERABAD LOCALITY ENGINE
+ *****************************************************************/
+
+const DV_LOCALITIES = [
+  'Jubilee Hills', 'Banjara Hills', 'Madhapur', 'HITEC City', 'Gachibowli',
+  'Kondapur', 'Financial District', 'Kokapet', 'Nanakramguda', 'Manikonda',
+  'Film Nagar', 'Begumpet', 'Somajiguda', 'Punjagutta', 'Ameerpet',
+  'Secunderabad', 'Kukatpally', 'KPHB', 'Miyapur', 'Nizampet',
+  'Kompally', 'Sainikpuri', 'AS Rao Nagar', 'Uppal', 'Nagole',
+  'LB Nagar', 'Dilsukhnagar', 'Himayat Nagar', 'Abids', 'Basheerbagh',
+  'Mehdipatnam', 'Tolichowki', 'Attapur', 'Shamshabad'
+];
+
+const DV_PREMIUM_LOCALITIES = [
+  'Jubilee Hills', 'Banjara Hills', 'Madhapur', 'HITEC City', 'Gachibowli',
+  'Financial District', 'Kokapet', 'Nanakramguda', 'Film Nagar'
+];
+
+
+/*****************************************************************
  * MENU
- ***************************************************************/
+ *****************************************************************/
 
 function onOpen() {
 
   SpreadsheetApp.getUi()
-    .createMenu('DV LEADS')
-    .addItem('Setup / Update System', 'setupDVLeadSystem')
+    .createMenu('DV INTELLIGENCE')
+    .addItem('Setup / Update V3 System', 'setupV3')
     .addSeparator()
-    .addItem('Run Lead Search (Manual)', 'runLeadSearch')
-    .addItem('Run Search Queue Now', 'runSearchQueueNow')
+    .addItem('Set / Update API Key', 'setPlacesAPIKey')
+    .addItem('Test API', 'testPlacesAPI')
+    .addSeparator()
+    .addItem('Update Search Queue (Add New Categories)', 'generateSearchQueue')
+    .addItem('Run Daily Discovery', 'runDailyDiscovery')
+    .addItem('Run Next 10 Searches', 'runNext10Searches')
     .addItem('Refresh Existing Leads Now', 'refreshExistingLeadsNow')
     .addSeparator()
-    .addItem('Enable Daily Auto-Refinement', 'enableDailyAutoRefinement')
-    .addItem('Disable Daily Auto-Refinement', 'disableDailyAutoRefinement')
+    .addItem('Refresh Category Views', 'refreshCategoryViews')
+    .addItem('Refresh Coverage', 'refreshCoverage')
     .addSeparator()
-    .addItem('Clear Search Results', 'clearLeadResults')
-    .addSeparator()
-    .addItem('Save API Key Securely', 'saveApiKeySecurely')
-    .addItem('Test API Connection', 'testAPIConnection')
+    .addItem('Enable Daily Automation', 'enableDailyAutomation')
+    .addItem('Disable Daily Automation', 'disableDailyAutomation')
     .addToUi();
 
 }
 
 
-/***************************************************************
- * INITIAL SETUP (safe to re-run — never wipes existing data)
- ***************************************************************/
+/*****************************************************************
+ * SETUP (idempotent — safe to re-run any time)
+ *****************************************************************/
 
-function setupDVLeadSystem() {
+function setupV3() {
 
   const ss = SpreadsheetApp.getActive();
 
-  createSearchSheet_(ss);
-  createQueueSheet_(ss);
-  createLeadsSheet_(ss);
-  createRawSheet_(ss);
-  createLogSheet_(ss);
-  createSettingsSheet_(ss);
+  const queueSheetExisted = !!ss.getSheetByName(DV3.SHEETS.QUEUE) &&
+    ss.getSheetByName(DV3.SHEETS.QUEUE).getLastRow() > 0;
 
-  ensureHeaderColumn_(ss.getSheetByName(DV.SHEETS.LEADS), 'Last Refreshed');
-  ensureHeaderColumn_(ss.getSheetByName(DV.SHEETS.LOG), 'Run Type');
+  createControlSheet_(ss);
+  createMasterSheet_(ss);
+  createQueueSheet_(ss);
+  createCoverageSheet_(ss);
+  createLogSheet_(ss);
+  createRawSheet_(ss);
+  createCategorySheets_(ss);
+
+  if (!queueSheetExisted) {
+    generateSearchQueue();
+  }
+
+  refreshCategoryViews();
+  refreshCoverage();
+  updateControlStats_();
 
   SpreadsheetApp.getUi().alert(
-    'DV Sales Intelligence V2 is ready.\n\n' +
-    'Next:\n' +
-    '1. Open SETTINGS, paste your Google Places API key, then run\n' +
-    '   DV LEADS → Save API Key Securely\n' +
-    '2. Open SEARCH QUEUE and activate the searches you want to run daily\n' +
-    '   (or use SEARCH for a one-off manual search)\n' +
-    '3. DV LEADS → Enable Daily Auto-Refinement to keep leads fresh\n' +
-    '   automatically, or run things on demand from the menu.'
+    'DV GOOGLE INTELLIGENCE V3 READY\n\n' +
+    'Next steps:\n\n' +
+    '1. DV INTELLIGENCE -> Set / Update API Key\n' +
+    '2. Test API\n' +
+    '3. Open CONTROL and set your Daily Target\n' +
+    '4. Run Daily Discovery (or Enable Daily Automation)\n\n' +
+    'Safe to re-run this any time — it will never erase your\n' +
+    'CONTROL settings, search queue progress, or leads.'
   );
 
 }
 
 
-/***************************************************************
- * SEARCH SHEET (single manual query)
- ***************************************************************/
+/*****************************************************************
+ * CONTROL (label/value settings sheet — idempotent)
+ *****************************************************************/
 
-function createSearchSheet_(ss) {
+function createControlSheet_(ss) {
 
-  let sh = getOrCreateSheet_(ss, DV.SHEETS.SEARCH);
-
-  if (sh.getLastRow() > 0) {
-    return; // already configured — don't touch the user's values
-  }
-
-  const values = [
-    ['DV SALES INTELLIGENCE', ''],
-    ['GOOGLE BUSINESS DISCOVERY — MANUAL SEARCH', ''],
-    ['', ''],
-    ['SEARCH PARAMETER', 'VALUE'],
-    ['Business / Keyword', 'Restaurants'],
-    ['Location', 'Hyderabad, Telangana'],
-    ['Additional Keywords', ''],
-    ['Minimum Rating', 4],
-    ['Minimum Reviews', 100],
-    ['Maximum Results', 100],
-    ['', ''],
-    ['Tip', 'For recurring / daily searches, use the SEARCH QUEUE sheet instead.']
-  ];
-
-  sh.getRange(1, 1, values.length, 2).setValues(values);
-
-  sh.setColumnWidth(1, 220);
-  sh.setColumnWidth(2, 320);
-
-  sh.getRange('A1:B1').merge().setFontSize(18).setFontWeight('bold');
-  sh.getRange('A2:B2').merge().setFontSize(10);
-  sh.getRange('A4:B4').setFontWeight('bold');
-
-  sh.setFrozenRows(4);
-
-}
-
-
-/***************************************************************
- * SEARCH QUEUE (many queries, run automatically every day)
- ***************************************************************/
-
-function createQueueSheet_(ss) {
-
-  let sh = getOrCreateSheet_(ss, DV.SHEETS.QUEUE);
-
-  if (sh.getLastRow() > 0) {
-    return; // already configured — don't touch the user's queries
-  }
-
-  const headers = [
-    'Active', 'Business / Keyword', 'Location', 'Additional Keywords',
-    'Minimum Rating', 'Minimum Reviews', 'Maximum Results',
-    'Last Run', 'New Leads (Last Run)', 'Status'
-  ];
-
-  sh.getRange(1, 1, 1, headers.length)
-    .setValues([headers])
-    .setFontWeight('bold');
-
-  sh.setFrozenRows(1);
-
-  // Seeded inactive — flip "Active" to TRUE for the searches you want to run daily.
-  const seed = [
-    [false, 'Restaurants', 'Hyderabad, Telangana', '', 4, 100, 100, '', '', ''],
-    [false, 'Cafes', 'Jubilee Hills Hyderabad', '', 4, 50, 100, '', '', ''],
-    [false, 'Hotels', 'Hyderabad, Telangana', '', 4, 100, 100, '', '', ''],
-    [false, 'Interior Designers', 'Hyderabad, Telangana', '', 4, 25, 100, '', '', ''],
-    [false, 'Jewellery Stores', 'Hyderabad, Telangana', '', 4, 50, 100, '', '', ''],
-    [false, 'Hospitals', 'Hyderabad, Telangana', '', 4, 100, 100, '', '', '']
-  ];
-
-  sh.getRange(2, 1, seed.length, headers.length).setValues(seed);
-  sh.getRange(2, 1, 200, 1).insertCheckboxes();
-
-  sh.autoResizeColumns(1, headers.length);
-
-}
-
-
-/***************************************************************
- * LEADS SHEET
- ***************************************************************/
-
-function createLeadsSheet_(ss) {
-
-  let sh = getOrCreateSheet_(ss, DV.SHEETS.LEADS);
-
-  if (sh.getLastRow() > 0) {
-    return; // never wipe existing leads
-  }
-
-  sh.getRange(1, 1, 1, DV.LEADS_HEADERS.length)
-    .setValues([DV.LEADS_HEADERS])
-    .setFontWeight('bold');
-
-  sh.setFrozenRows(1);
-  sh.getRange(1, 1, 1, DV.LEADS_HEADERS.length).createFilter();
-  sh.autoResizeColumns(1, DV.LEADS_HEADERS.length);
-
-}
-
-
-/***************************************************************
- * RAW DATA
- ***************************************************************/
-
-function createRawSheet_(ss) {
-
-  let sh = getOrCreateSheet_(ss, DV.SHEETS.RAW);
-
-  if (sh.getLastRow() > 0) {
-    return;
-  }
-
-  const headers = ['Timestamp', 'Search Query', 'Place ID', 'Raw JSON'];
-
-  sh.getRange(1, 1, 1, headers.length)
-    .setValues([headers])
-    .setFontWeight('bold');
-
-  sh.setFrozenRows(1);
-
-}
-
-
-/***************************************************************
- * RUN LOG
- ***************************************************************/
-
-function createLogSheet_(ss) {
-
-  let sh = getOrCreateSheet_(ss, DV.SHEETS.LOG);
-
-  if (sh.getLastRow() > 0) {
-    return;
-  }
-
-  sh.getRange(1, 1, 1, DV.LOG_HEADERS.length)
-    .setValues([DV.LOG_HEADERS])
-    .setFontWeight('bold');
-
-  sh.setFrozenRows(1);
-
-}
-
-
-/***************************************************************
- * SETTINGS
- ***************************************************************/
-
-function createSettingsSheet_(ss) {
-
-  let sh = getOrCreateSheet_(ss, DV.SHEETS.SETTINGS);
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.CONTROL);
 
   if (sh.getLastRow() === 0) {
 
-    const values = [
-      ['DV SALES INTELLIGENCE — SETTINGS', ''],
+    const rows = [
+      ['DV SOCIAL — GOOGLE BUSINESS INTELLIGENCE', ''],
+      ['VERSION', DV3.VERSION],
       ['', ''],
       ['SETTING', 'VALUE'],
-      ['Google Places API Key', 'PASTE_API_KEY_HERE'],
-      ['Default Country', 'IN'],
-      ['Language', 'en'],
-      ['Maximum Pages Per Search', 3],
-      ['Leads To Refresh Per Day', 50],
-      ['Max Daily API Calls', 150],
-      ['Max Raw Data Rows', 5000],
-      ['Daily Auto-Run Hour (0-23)', 6],
-      ['Auto-Refresh Enabled', 'FALSE']
+      ['Daily New Lead Target', DV3.DEFAULT_DAILY_TARGET],
+      ['Maximum Daily Target', DV3.MAX_DAILY_TARGET],
+      ['Default City', 'Hyderabad'],
+      ['Default State', 'Telangana'],
+      ['Country', 'India'],
+      ['Daily Automation Hour (0-23)', 7],
+      ['Max API Calls Per Run', DV3.DEFAULT_MAX_API_CALLS_PER_RUN],
+      ['Leads To Refresh Per Day', DV3.DEFAULT_LEADS_TO_REFRESH_PER_DAY],
+      ['Max Raw Data Rows', DV3.DEFAULT_MAX_RAW_ROWS],
+      ['Daily Automation Enabled', 'FALSE'],
+      ['', ''],
+      ['SYSTEM STATUS', ''],
+      ['Last Discovery Run', ''],
+      ['Last New Leads', 0],
+      ['Last Leads Refreshed', 0],
+      ['Total Master Leads', 0],
+      ['Remaining Queue', 0]
     ];
 
-    sh.getRange(1, 1, values.length, 2).setValues(values);
+    sh.getRange(1, 1, rows.length, 2).setValues(rows);
 
-    sh.getRange('A1:B1').merge().setFontSize(16).setFontWeight('bold');
-    sh.getRange('A3:B3').setFontWeight('bold');
+    sh.getRange('A1:B1').merge().setFontSize(18).setFontWeight('bold');
+    sh.getRange('A4:B4').setFontWeight('bold');
+    sh.getRange('A16:B16').setFontWeight('bold');
 
-    sh.setColumnWidth(1, 260);
-    sh.setColumnWidth(2, 400);
+    sh.setColumnWidth(1, 280);
+    sh.setColumnWidth(2, 300);
 
     return;
 
   }
 
-  // Sheet already exists from V1 — add any new V2 settings without
-  // touching the user's existing values (API key, etc.).
-  ensureSettingRow_(sh, 'Leads To Refresh Per Day', 50);
-  ensureSettingRow_(sh, 'Max Daily API Calls', 150);
-  ensureSettingRow_(sh, 'Max Raw Data Rows', 5000);
-  ensureSettingRow_(sh, 'Daily Auto-Run Hour (0-23)', 6);
-  ensureSettingRow_(sh, 'Auto-Refresh Enabled', 'FALSE');
+  // Sheet already exists — add any settings introduced since, without
+  // touching anything the user has already configured.
+  ensureControlRow_(sh, 'Max API Calls Per Run', DV3.DEFAULT_MAX_API_CALLS_PER_RUN);
+  ensureControlRow_(sh, 'Leads To Refresh Per Day', DV3.DEFAULT_LEADS_TO_REFRESH_PER_DAY);
+  ensureControlRow_(sh, 'Max Raw Data Rows', DV3.DEFAULT_MAX_RAW_ROWS);
+  ensureControlRow_(sh, 'Daily Automation Enabled', 'FALSE');
+  ensureControlRow_(sh, 'Last Leads Refreshed', 0);
 
 }
 
 
-function ensureSettingRow_(sh, label, defaultValue) {
+function ensureControlRow_(sh, label, defaultValue) {
 
   const lastRow = sh.getLastRow();
-
-  const labels = sh.getRange(1, 1, lastRow, 1)
-    .getValues()
-    .map(function(r) { return String(r[0]).trim(); });
+  const labels = sh.getRange(1, 1, lastRow, 1).getValues().map(function(r) { return String(r[0]).trim(); });
 
   if (labels.indexOf(label) === -1) {
     sh.getRange(lastRow + 1, 1, 1, 2).setValues([[label, defaultValue]]);
@@ -388,12 +372,98 @@ function ensureSettingRow_(sh, label, defaultValue) {
 }
 
 
-function ensureHeaderColumn_(sh, headerName) {
+function getControlValue_(label) {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.CONTROL);
+
+  if (!sh) return null;
+
+  const lastRow = sh.getLastRow();
+  if (lastRow === 0) return null;
+
+  const values = sh.getRange(1, 1, lastRow, 2).getValues();
+
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0]).trim() === label) return values[i][1];
+  }
+
+  return null;
+
+}
+
+
+function setControlValue_(label, value) {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.CONTROL);
 
   if (!sh) return;
 
-  const lastCol = sh.getLastColumn();
+  const lastRow = sh.getLastRow();
+  const labels = sh.getRange(1, 1, lastRow, 1).getValues().map(function(r) { return String(r[0]).trim(); });
+  const idx = labels.indexOf(label);
 
+  if (idx !== -1) {
+    sh.getRange(idx + 1, 2).setValue(value);
+  }
+
+}
+
+
+function getDailyTarget_() {
+  const raw = Number(getControlValue_('Daily New Lead Target')) || DV3.DEFAULT_DAILY_TARGET;
+  return Math.min(raw, DV3.MAX_DAILY_TARGET);
+}
+
+function getMaxApiCallsPerRun_() {
+  return Math.max(1, Number(getControlValue_('Max API Calls Per Run')) || DV3.DEFAULT_MAX_API_CALLS_PER_RUN);
+}
+
+function getLeadsToRefreshPerDay_() {
+  return Math.max(0, Number(getControlValue_('Leads To Refresh Per Day')) || DV3.DEFAULT_LEADS_TO_REFRESH_PER_DAY);
+}
+
+function getMaxRawRows_() {
+  return Math.max(100, Number(getControlValue_('Max Raw Data Rows')) || DV3.DEFAULT_MAX_RAW_ROWS);
+}
+
+function getAutomationHour_() {
+  const hour = Number(getControlValue_('Daily Automation Hour (0-23)'));
+  if (isNaN(hour) || hour < 0 || hour > 23) return 7;
+  return hour;
+}
+
+
+/*****************************************************************
+ * MASTER DATABASE
+ *****************************************************************/
+
+function createMasterSheet_(ss) {
+
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.MASTER);
+
+  if (sh.getLastRow() > 1) {
+    ensureHeaderColumn_(sh, 'Last Refreshed');
+    return;
+  }
+
+  sh.clear();
+
+  sh.getRange(1, 1, 1, DV3.MASTER_HEADERS.length)
+    .setValues([DV3.MASTER_HEADERS])
+    .setFontWeight('bold');
+
+  sh.setFrozenRows(1);
+  sh.getRange(1, 1, 1, DV3.MASTER_HEADERS.length).createFilter();
+  sh.autoResizeColumns(1, DV3.MASTER_HEADERS.length);
+
+}
+
+
+function ensureHeaderColumn_(sh, headerName) {
+
+  const lastCol = sh.getLastColumn();
   if (lastCol === 0) return;
 
   const headers = sh.getRange(1, 1, 1, lastCol).getValues()[0];
@@ -405,163 +475,189 @@ function ensureHeaderColumn_(sh, headerName) {
 }
 
 
-/***************************************************************
- * MANUAL SEARCH (DV LEADS → Run Lead Search)
- ***************************************************************/
+/*****************************************************************
+ * SEARCH QUEUE (idempotent — generateSearchQueue() populates it)
+ *****************************************************************/
 
-function runLeadSearch() {
+function createQueueSheet_(ss) {
 
-  const ss = SpreadsheetApp.getActive();
-  const searchSheet = ss.getSheetByName(DV.SHEETS.SEARCH);
-  const leadsSheet = ss.getSheetByName(DV.SHEETS.LEADS);
-  const rawSheet = ss.getSheetByName(DV.SHEETS.RAW);
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.QUEUE);
 
-  if (!searchSheet || !leadsSheet) {
-    SpreadsheetApp.getUi().alert('Please run "Setup / Update System" first.');
-    return;
+  if (sh.getLastRow() > 0) {
+    return; // never wipe existing queue progress
   }
 
-  const business = String(searchSheet.getRange('B5').getValue()).trim();
-  const location = String(searchSheet.getRange('B6').getValue()).trim();
-  const additional = String(searchSheet.getRange('B7').getValue()).trim();
-  const minRating = Number(searchSheet.getRange('B8').getValue()) || 0;
-  const minReviews = Number(searchSheet.getRange('B9').getValue()) || 0;
-  const maxResults = Number(searchSheet.getRange('B10').getValue()) || 100;
+  sh.getRange(1, 1, 1, DV3.QUEUE_HEADERS.length)
+    .setValues([DV3.QUEUE_HEADERS])
+    .setFontWeight('bold');
 
-  if (!business || !location) {
-    SpreadsheetApp.getUi().alert('Business/Keyword and Location are required.');
-    return;
-  }
-
-  let query = business;
-  if (additional) query += ' ' + additional;
-  query += ' in ' + location;
-
-  const apiKey = getAPIKey_();
-
-  if (!apiKey) {
-    SpreadsheetApp.getUi().alert('Add your Google Places API key in SETTINGS.');
-    return;
-  }
-
-  const existingPlaceIds = getExistingPlaceIds_(leadsSheet);
-  let result;
-
-  try {
-    result = performSearch_(query, location, apiKey, maxResults, minRating, minReviews,
-      leadsSheet, rawSheet, existingPlaceIds, null);
-  } catch (error) {
-    logRun_(query, emptyStats_(), '0', 'FAILURE', String(error.message || error), 'MANUAL');
-    SpreadsheetApp.getUi().alert('Search failed:\n\n' + error.message);
-    return;
-  }
-
-  logRun_(query, result.stats, result.seconds, 'SUCCESS', 'Search completed', 'MANUAL');
-
-  SpreadsheetApp.getUi().alert(
-    'DV LEAD SEARCH COMPLETE\n\n' +
-    'Query:\n' + query +
-    '\n\nAPI Results: ' + result.stats.apiResults +
-    '\nPassed Filters: ' + result.stats.passed +
-    '\nNew Leads: ' + result.stats.newLeads +
-    '\nDuplicates: ' + result.stats.duplicates +
-    '\nRejected by Rating: ' + result.stats.rejectedRating +
-    '\nRejected by Reviews: ' + result.stats.rejectedReviews +
-    '\n\nExecution Time: ' + result.seconds + ' sec'
-  );
+  sh.setFrozenRows(1);
 
 }
 
 
-/***************************************************************
- * SEARCH QUEUE — MANUAL TRIGGER (DV LEADS → Run Search Queue Now)
- ***************************************************************/
+/*****************************************************************
+ * GENERATE / UPDATE SEARCH QUEUE (preserves existing progress)
+ *****************************************************************/
 
-function runSearchQueueNow() {
-
-  const apiKey = getAPIKey_();
-
-  if (!apiKey) {
-    SpreadsheetApp.getUi().alert('Add your Google Places API key in SETTINGS.');
-    return;
-  }
-
-  const budget = { remaining: getMaxDailyApiCalls_() };
-  const stats = runSearchQueue_(budget);
-
-  SpreadsheetApp.getUi().alert(
-    'SEARCH QUEUE COMPLETE\n\n' +
-    'Active queries run: ' + stats.queriesRun +
-    '\nNew leads found: ' + stats.newLeads
-  );
-
-}
-
-
-/***************************************************************
- * LEAD REFRESH — MANUAL TRIGGER (DV LEADS → Refresh Existing Leads Now)
- ***************************************************************/
-
-function refreshExistingLeadsNow() {
-
-  const apiKey = getAPIKey_();
-
-  if (!apiKey) {
-    SpreadsheetApp.getUi().alert('Add your Google Places API key in SETTINGS.');
-    return;
-  }
-
-  const budget = { remaining: getMaxDailyApiCalls_() };
-  const stats = refreshExistingLeads_(budget);
-
-  SpreadsheetApp.getUi().alert(
-    'LEAD REFRESH COMPLETE\n\n' +
-    'Checked: ' + stats.checked +
-    '\nUpdated: ' + stats.updated +
-    '\nNewly Closed: ' + stats.closed +
-    '\nNot Found (removed from Google): ' + stats.notFound
-  );
-
-}
-
-
-/***************************************************************
- * DAILY AUTO-REFINEMENT (installed trigger entry point)
- ***************************************************************/
-
-function runDailyRefinement() {
+function generateSearchQueue() {
 
   const lock = LockService.getScriptLock();
-
-  if (!lock.tryLock(5000)) {
-    return; // another run is already in progress
-  }
-
-  const startTime = new Date();
+  if (!lock.tryLock(10000)) return;
 
   try {
 
-    const apiKey = getAPIKey_();
+    const ss = SpreadsheetApp.getActive();
+    let sh = ss.getSheetByName(DV3.SHEETS.QUEUE);
 
-    if (!apiKey) {
-      logRun_('DAILY AUTO-REFINEMENT', emptyStats_(), '0', 'FAILURE', 'No API key configured.', 'AUTO');
-      return;
+    if (!sh) {
+      createQueueSheet_(ss);
+      sh = ss.getSheetByName(DV3.SHEETS.QUEUE);
     }
 
-    const budget = { remaining: getMaxDailyApiCalls_() };
+    const existing = {};
 
-    const queueStats = runSearchQueue_(budget);
-    const refreshStats = refreshExistingLeads_(budget);
+    if (sh.getLastRow() > 1) {
+      const old = sh.getRange(2, 1, sh.getLastRow() - 1, DV3.QUEUE_HEADERS.length).getValues();
+      old.forEach(function(row) {
+        existing[row[5]] = {
+          status: row[7], lastRun: row[8], apiResults: row[9],
+          newLeads: row[10], duplicates: row[11], runCount: row[12]
+        };
+      });
+    }
 
-    trimRawData_();
+    const rows = [];
+    let queueNumber = 1;
 
-    const seconds = ((new Date() - startTime) / 1000).toFixed(2);
+    DV_CATEGORIES.forEach(function(category) {
+      category.queries.forEach(function(keyword) {
+        DV_LOCALITIES.forEach(function(locality) {
 
-    logDailyRun_(queueStats, refreshStats, seconds);
+          const fullQuery = keyword + ' in ' + locality + ', Hyderabad, Telangana';
+          const history = existing[fullQuery] || {};
+
+          rows.push([
+            'Q-' + String(queueNumber).padStart(5, '0'),
+            category.group, category.category, keyword, locality, fullQuery,
+            calculateQueryPriority_(category.group, category.category, locality),
+            history.status || 'PENDING',
+            history.lastRun || '',
+            history.apiResults || 0,
+            history.newLeads || 0,
+            history.duplicates || 0,
+            history.runCount || 0
+          ]);
+
+          queueNumber++;
+
+        });
+      });
+    });
+
+    if (sh.getLastRow() > 1) {
+      sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).clearContent();
+    }
+
+    if (rows.length) {
+      sh.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+      sh.getRange(2, 1, rows.length, rows[0].length).sort([{ column: 7, ascending: false }]);
+    }
+
+    updateControlStats_();
+
+  } finally {
+    lock.releaseLock();
+  }
+
+}
+
+
+/*****************************************************************
+ * QUERY PRIORITY
+ *****************************************************************/
+
+function calculateQueryPriority_(group, category, locality) {
+
+  let score = 50;
+
+  if (group === 'Food & Hospitality') score += 25;
+  if (group === 'Fashion & Retail') score += 20;
+  if (group === 'Beauty & Wellness') score += 15;
+  if (group === 'Real Estate') score += 15;
+
+  if (DV_PREMIUM_LOCALITIES.indexOf(locality) !== -1) score += 20;
+  if (category === 'Cloud Kitchens') score += 10;
+
+  return score;
+
+}
+
+
+/*****************************************************************
+ * RUN DAILY DISCOVERY (new leads + existing-lead refresh, in one
+ * time- and budget-bounded run)
+ *****************************************************************/
+
+function runDailyDiscovery() {
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+
+  const started = new Date();
+  const deadline = started.getTime() + DV3.MAX_RUN_MS;
+
+  try {
+
+    const apiKey = getPlacesAPIKey_();
+    if (!apiKey) throw new Error('Google Places API key not configured.');
+
+    const target = getDailyTarget_();
+    const budget = { remaining: getMaxApiCallsPerRun_() };
+
+    // Reserve time at the tail of the run for the refresh pass so it
+    // never gets starved by a long discovery phase.
+    const discoveryDeadline = deadline - DV3.MIN_REFRESH_RESERVE_MS;
+
+    const discoveryResult = runDiscoveryBatch_(target, Infinity, budget, discoveryDeadline);
+    const refreshResult = refreshExistingLeads_(budget, deadline);
+
+    refreshCategoryViews();
+    refreshCoverage();
+    updateControlStats_();
+
+    setControlValue_('Last Discovery Run', new Date());
+    setControlValue_('Last New Leads', discoveryResult.newLeads);
+    setControlValue_('Last Leads Refreshed', refreshResult.updated);
+
+    const seconds = ((new Date() - started) / 1000).toFixed(2);
+
+    logSystemRun_(
+      'DAILY DISCOVERY', discoveryResult.searchesRun, discoveryResult.apiResults,
+      discoveryResult.newLeads, discoveryResult.duplicates, seconds, 'SUCCESS',
+      'Target: ' + target + ' | Refreshed: ' + refreshResult.updated +
+      ' | Newly Closed: ' + refreshResult.closed
+    );
+
+    SpreadsheetApp.getUi().alert(
+      'DV DAILY DISCOVERY COMPLETE\n\n' +
+      'Target: ' + target +
+      '\nNew Leads: ' + discoveryResult.newLeads +
+      '\nSearches Run: ' + discoveryResult.searchesRun +
+      '\nAPI Results: ' + discoveryResult.apiResults +
+      '\nDuplicates: ' + discoveryResult.duplicates +
+      '\n\nLeads Refreshed: ' + refreshResult.updated +
+      '\nNewly Closed: ' + refreshResult.closed +
+      '\n\nTime: ' + seconds + ' sec'
+    );
 
   } catch (error) {
 
-    logRun_('DAILY AUTO-REFINEMENT', emptyStats_(), '0', 'FAILURE', String(error.message || error), 'AUTO');
+    logSystemRun_('DAILY DISCOVERY', 0, 0, 0, 0, 0, 'ERROR', error.message);
+
+    // A trigger-fired run has no UI to alert — only show a dialog if
+    // this was launched interactively from the menu.
+    try { SpreadsheetApp.getUi().alert('V3 ERROR\n\n' + error.message); } catch (e) {}
 
   } finally {
 
@@ -572,280 +668,446 @@ function runDailyRefinement() {
 }
 
 
-function enableDailyAutoRefinement() {
+/*****************************************************************
+ * RUN NEXT 10 (manual, bounded batch)
+ *****************************************************************/
 
-  removeExistingTriggers_(DV.DAILY_TRIGGER_HANDLER);
+function runNext10Searches() {
 
-  const hour = getDailyRunHour_();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
 
-  ScriptApp.newTrigger(DV.DAILY_TRIGGER_HANDLER)
-    .timeBased()
-    .atHour(hour)
-    .everyDays(1)
-    .create();
+  try {
 
-  setSettingValue_('Auto-Refresh Enabled', 'TRUE');
+    const apiKey = getPlacesAPIKey_();
 
-  SpreadsheetApp.getUi().alert(
-    'Daily Auto-Refinement enabled.\n\n' +
-    'Once a day, around ' + hour + ':00 (script timezone), this will run your ' +
-    'active SEARCH QUEUE and refresh your oldest existing leads automatically.'
-  );
-
-}
-
-
-function disableDailyAutoRefinement() {
-
-  removeExistingTriggers_(DV.DAILY_TRIGGER_HANDLER);
-  setSettingValue_('Auto-Refresh Enabled', 'FALSE');
-
-  SpreadsheetApp.getUi().alert('Daily Auto-Refinement disabled.');
-
-}
-
-
-function removeExistingTriggers_(handlerName) {
-
-  ScriptApp.getProjectTriggers().forEach(function(trigger) {
-    if (trigger.getHandlerFunction() === handlerName) {
-      ScriptApp.deleteTrigger(trigger);
-    }
-  });
-
-}
-
-
-/***************************************************************
- * CORE SEARCH (shared by manual search and the queue)
- ***************************************************************/
-
-function performSearch_(query, location, apiKey, maxResults, minRating, minReviews,
-    leadsSheet, rawSheet, existingPlaceIds, budget) {
-
-  const startTime = new Date();
-
-  const stats = emptyStats_();
-
-  let pageToken = null;
-  let page = 0;
-
-  const maxPages = getMaxPagesPerSearch_();
-
-  while (stats.newLeads < maxResults && page < maxPages) {
-
-    if (budget && budget.remaining <= 0) break;
-
-    page++;
-    if (budget) budget.remaining--;
-
-    const response = callGooglePlaces_(query, apiKey, pageToken);
-
-    if (!response) break;
-
-    const places = response.places || [];
-    stats.apiResults += places.length;
-
-    const leadRows = [];
-    const rawRows = [];
-
-    places.forEach(function(place) {
-
-      rawRows.push([new Date(), query, place.id || '', JSON.stringify(place)]);
-
-      const rating = Number(place.rating || 0);
-
-      if (rating < minRating) {
-        stats.rejectedRating++;
-        return;
-      }
-
-      const reviews = Number(place.userRatingCount || 0);
-
-      if (reviews < minReviews) {
-        stats.rejectedReviews++;
-        return;
-      }
-
-      stats.passed++;
-
-      const placeId = place.id || '';
-
-      if (placeId && existingPlaceIds.has(placeId)) {
-        stats.duplicates++;
-        return;
-      }
-
-      if (stats.newLeads >= maxResults) {
-        return; // cap reached — leave remaining places for a future run
-      }
-
-      const name = place.displayName ? place.displayName.text : '';
-      const category = place.primaryTypeDisplayName ? place.primaryTypeDisplayName.text : '';
-      const address = place.formattedAddress || '';
-      const phone = place.nationalPhoneNumber || '';
-      const internationalPhone = place.internationalPhoneNumber || '';
-      const website = place.websiteUri || '';
-      const mapsUrl = place.googleMapsUri || '';
-      const latitude = place.location ? place.location.latitude : '';
-      const longitude = place.location ? place.location.longitude : '';
-      const businessStatus = place.businessStatus || '';
-      const priceLevel = place.priceLevel || '';
-      const openingHours = extractOpeningHours_(place);
-      const leadScore = calculateLeadScore_(rating, reviews, website, phone, businessStatus);
-      const leadId = createLeadId_(placeId);
-      const now = new Date();
-
-      leadRows.push([
-        leadId, name, category, address, location, phone, internationalPhone, website,
-        rating, reviews, priceLevel, mapsUrl, placeId, latitude, longitude, businessStatus,
-        openingHours, query, now, leadScore, 'NEW', '', now
-      ]);
-
-      if (placeId) existingPlaceIds.add(placeId);
-
-      stats.newLeads++;
-
-    });
-
-    // Flush per page so a later failure doesn't lose leads already found.
-    if (leadRows.length > 0) {
-      const startRow = leadsSheet.getLastRow() + 1;
-      leadsSheet.getRange(startRow, 1, leadRows.length, leadRows[0].length).setValues(leadRows);
+    if (!apiKey) {
+      SpreadsheetApp.getUi().alert('Set your Google Places API key first (DV INTELLIGENCE -> Set / Update API Key).');
+      return;
     }
 
-    if (rawRows.length > 0) {
-      const rawStart = rawSheet.getLastRow() + 1;
-      rawSheet.getRange(rawStart, 1, rawRows.length, rawRows[0].length).setValues(rawRows);
-    }
+    const budget = { remaining: getMaxApiCallsPerRun_() };
+    const deadline = new Date().getTime() + DV3.MAX_RUN_MS;
 
-    if (stats.newLeads >= maxResults) break;
+    const result = runDiscoveryBatch_(Infinity, 10, budget, deadline);
 
-    pageToken = response.nextPageToken || null;
+    refreshCategoryViews();
+    refreshCoverage();
+    updateControlStats_();
 
-    if (!pageToken) break;
+    SpreadsheetApp.getUi().alert(
+      'SEARCHES COMPLETE\n\n' +
+      'Searches Run: ' + result.searchesRun +
+      '\nNew Leads: ' + result.newLeads +
+      '\nDuplicates: ' + result.duplicates
+    );
 
-    // Google's nextPageToken needs a moment to become valid.
-    Utilities.sleep(1500);
+  } finally {
+
+    lock.releaseLock();
 
   }
 
-  const seconds = ((new Date() - startTime) / 1000).toFixed(2);
+}
 
-  return { stats: stats, seconds: seconds };
+
+/*****************************************************************
+ * SHARED DISCOVERY CORE
+ * Picks the highest-priority PENDING/RETRY queue rows and executes
+ * them, bounded by new-lead target, search count, API budget, and
+ * a hard deadline — whichever comes first.
+ *****************************************************************/
+
+function runDiscoveryBatch_(target, maxSearches, budget, deadline) {
+
+  const ss = SpreadsheetApp.getActive();
+  const queue = ss.getSheetByName(DV3.SHEETS.QUEUE);
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+
+  const result = { searchesRun: 0, apiResults: 0, newLeads: 0, duplicates: 0 };
+
+  if (!queue || !master) {
+    throw new Error('Run Setup / Update V3 System first.');
+  }
+
+  if (queue.getLastRow() <= 1) {
+    return result; // queue has no rows yet
+  }
+
+  const existingIds = getExistingPlaceIds_(master);
+
+  const queueRows = queue.getRange(2, 1, queue.getLastRow() - 1, DV3.QUEUE_HEADERS.length).getValues();
+
+  const candidates = [];
+
+  queueRows.forEach(function(row, index) {
+    const status = String(row[7] || '');
+    if (status === 'PENDING' || status === 'RETRY') {
+      candidates.push({ sheetRow: index + 2, data: row });
+    }
+  });
+
+  candidates.sort(function(a, b) { return Number(b.data[6]) - Number(a.data[6]); });
+
+  for (let i = 0; i < candidates.length; i++) {
+
+    if (result.newLeads >= target) break;
+    if (result.searchesRun >= maxSearches) break;
+    if (budget.remaining <= 0) break;
+    if (new Date().getTime() >= deadline) break;
+
+    const item = candidates[i];
+    const row = item.data;
+
+    const searchResult = executeQueueSearch_(row, existingIds, target - result.newLeads, budget, deadline);
+
+    result.searchesRun++;
+    result.newLeads += searchResult.newLeads;
+    result.apiResults += searchResult.apiResults;
+    result.duplicates += searchResult.duplicates;
+
+    queue.getRange(item.sheetRow, 8, 1, 6).setValues([[
+      'DONE', new Date(), searchResult.apiResults, searchResult.newLeads,
+      searchResult.duplicates, Number(row[12] || 0) + 1
+    ]]);
+
+  }
+
+  // Queue was already fully exhausted before this run started — reset
+  // it for tomorrow. (This run still reports 0 new leads; the reset
+  // takes effect on the next run.)
+  if (candidates.length === 0) {
+    resetSearchQueue_();
+  }
+
+  return result;
 
 }
 
 
-/***************************************************************
- * SEARCH QUEUE PROCESSING
- ***************************************************************/
+/*****************************************************************
+ * EXECUTE ONE QUEUE SEARCH (budget- and deadline-aware)
+ *****************************************************************/
 
-function runSearchQueue_(budget) {
+function executeQueueSearch_(queueRow, existingIds, remainingTarget, budget, deadline) {
 
-  const ss = SpreadsheetApp.getActive();
-  const queueSheet = ss.getSheetByName(DV.SHEETS.QUEUE);
-  const leadsSheet = ss.getSheetByName(DV.SHEETS.LEADS);
-  const rawSheet = ss.getSheetByName(DV.SHEETS.RAW);
-  const apiKey = getAPIKey_();
+  const group = queueRow[1];
+  const category = queueRow[2];
+  const locality = queueRow[4];
+  const query = queueRow[5];
 
-  const stats = { queriesRun: 0, newLeads: 0 };
+  const apiKey = getPlacesAPIKey_();
 
-  if (!queueSheet || !leadsSheet || !apiKey) return stats;
+  let token = null;
+  let page = 0;
+  let apiResults = 0;
+  let duplicates = 0;
+  let newLeads = 0;
 
-  const lastRow = queueSheet.getLastRow();
-  if (lastRow <= 1) return stats;
+  const rows = [];
+  const rawRows = [];
 
-  const numRows = lastRow - 1;
-  const rows = queueSheet.getRange(2, 1, numRows, 10).getValues();
-  const existingPlaceIds = getExistingPlaceIds_(leadsSheet);
+  while (page < DV3.MAX_PAGES_PER_QUERY && newLeads < remainingTarget) {
 
-  rows.forEach(function(row, i) {
+    if (budget.remaining <= 0) break;
+    if (new Date().getTime() >= deadline) break;
 
-    const sheetRow = i + 2;
-    const active = row[0] === true;
+    budget.remaining--;
 
-    if (!active) return;
+    const response = callPlacesAPI_(query, token, apiKey);
+    page++;
 
-    if (budget && budget.remaining <= 0) {
-      queueSheet.getRange(sheetRow, 10).setValue('SKIPPED (Daily API budget reached)');
-      return;
-    }
+    const places = response.places || [];
+    apiResults += places.length;
 
-    const business = String(row[1]).trim();
-    const location = String(row[2]).trim();
-    const additional = String(row[3]).trim();
-    const minRating = Number(row[4]) || 0;
-    const minReviews = Number(row[5]) || 0;
-    const maxResults = Number(row[6]) || 100;
+    places.forEach(function(place) {
 
-    if (!business || !location) {
-      queueSheet.getRange(sheetRow, 10).setValue('SKIPPED (missing business or location)');
-      return;
-    }
+      if (newLeads >= remainingTarget) return;
 
-    let query = business;
-    if (additional) query += ' ' + additional;
-    query += ' in ' + location;
+      const placeId = place.id || '';
+
+      rawRows.push([new Date(), query, group, category, locality, placeId, JSON.stringify(place)]);
+
+      if (placeId && existingIds.has(placeId)) {
+        duplicates++;
+        return;
+      }
+
+      const lead = placeToLeadRow_(place, group, category, locality, query);
+      rows.push(lead);
+
+      if (placeId) existingIds.add(placeId);
+
+      newLeads++;
+
+    });
+
+    token = response.nextPageToken || null;
+    if (!token) break;
+
+    Utilities.sleep(500);
+
+  }
+
+  appendMasterRows_(rows);
+  appendRawRows_(rawRows);
+
+  return { apiResults: apiResults, newLeads: newLeads, duplicates: duplicates };
+
+}
+
+
+/*****************************************************************
+ * PLACE -> MASTER ROW
+ *****************************************************************/
+
+function placeToLeadRow_(place, group, category, locality, query) {
+
+  const name = place.displayName ? place.displayName.text : '';
+  const googleCategory = place.primaryTypeDisplayName ? place.primaryTypeDisplayName.text : '';
+  const googleTypes = place.types ? place.types.join(', ') : '';
+  const rating = Number(place.rating || 0);
+  const reviews = Number(place.userRatingCount || 0);
+  const phone = place.nationalPhoneNumber || '';
+  const internationalPhone = place.internationalPhoneNumber || '';
+  const website = place.websiteUri || '';
+  const businessStatus = place.businessStatus || '';
+
+  const score = calculateLeadScoreV3_(group, category, rating, reviews, website, phone, locality, businessStatus);
+  const priority = calculateLeadPriority_(score);
+  const contactability = calculateContactability_(website, phone);
+  const isFNB = group === 'Food & Hospitality';
+  const now = new Date();
+
+  return [
+    createDVLeadId_(place.id), name, group, category, googleCategory, googleTypes,
+    locality, place.formattedAddress || '', phone, internationalPhone, website,
+    rating || '', reviews || '', place.priceLevel || '', place.googleMapsUri || '',
+    place.id || '', place.location ? place.location.latitude : '',
+    place.location ? place.location.longitude : '', businessStatus,
+    extractOpeningHours_(place), query, now, now, score, priority, contactability,
+    isFNB ? 'NOT CHECKED' : 'N/A', '', isFNB ? 'PENDING' : 'N/A',
+    isFNB ? 'NOT CHECKED' : 'N/A', '', isFNB ? 'PENDING' : 'N/A',
+    isFNB ? 'PENDING' : 'N/A', '', '', '', '', 'NEW', '', '', now
+  ];
+
+}
+
+
+/*****************************************************************
+ * LEAD SCORE
+ *****************************************************************/
+
+function calculateLeadScoreV3_(group, category, rating, reviews, website, phone, locality, businessStatus) {
+
+  let score = 0;
+
+  if (reviews >= 5000) score += 25;
+  else if (reviews >= 2000) score += 22;
+  else if (reviews >= 1000) score += 20;
+  else if (reviews >= 500) score += 17;
+  else if (reviews >= 100) score += 12;
+  else if (reviews >= 25) score += 7;
+  else score += 3;
+
+  if (rating >= 4.5) score += 15;
+  else if (rating >= 4.2) score += 13;
+  else if (rating >= 4) score += 10;
+  else if (rating >= 3.5) score += 7;
+  else if (rating > 0) score += 3;
+
+  if (website) score += 15;
+  if (phone) score += 10;
+
+  if (group === 'Food & Hospitality') score += 15;
+  else if (group === 'Fashion & Retail') score += 15;
+  else if (group === 'Beauty & Wellness') score += 12;
+  else if (group === 'Real Estate') score += 12;
+  else score += 8;
+
+  if (DV_PREMIUM_LOCALITIES.indexOf(locality) !== -1) score += 10;
+  if (category === 'Cloud Kitchens') score += 5;
+
+  score = Math.min(score, 100);
+
+  // A closed business is not a sellable lead, however strong its
+  // historical numbers were.
+  if (businessStatus === 'CLOSED_PERMANENTLY') return 0;
+  if (businessStatus === 'CLOSED_TEMPORARILY') return Math.round(score * 0.5);
+
+  return score;
+
+}
+
+
+/*****************************************************************
+ * PRIORITY / CONTACTABILITY
+ *****************************************************************/
+
+function calculateLeadPriority_(score) {
+  if (score >= 80) return 'HOT';
+  if (score >= 65) return 'HIGH';
+  if (score >= 45) return 'MEDIUM';
+  return 'LOW';
+}
+
+
+function calculateContactability_(website, phone) {
+  let score = 0;
+  if (website) score += 50;
+  if (phone) score += 50;
+  return score;
+}
+
+
+/*****************************************************************
+ * GOOGLE PLACES API (Text Search + Place Details, with retry)
+ *****************************************************************/
+
+function callPlacesAPI_(query, pageToken, apiKey) {
+
+  const payload = { textQuery: query, pageSize: DV3.PAGE_SIZE, languageCode: 'en', regionCode: 'IN' };
+  if (pageToken) payload.pageToken = pageToken;
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'X-Goog-Api-Key': apiKey, 'X-Goog-FieldMask': DV3.FIELD_MASK },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  return fetchWithRetry_(DV3.ENDPOINT, options);
+
+}
+
+
+function callPlaceDetailsAPI_(placeId, apiKey) {
+
+  const url = DV3.DETAILS_ENDPOINT + encodeURIComponent(placeId);
+
+  const options = {
+    method: 'get',
+    headers: { 'X-Goog-Api-Key': apiKey, 'X-Goog-FieldMask': DV3.DETAILS_FIELD_MASK },
+    muteHttpExceptions: true
+  };
+
+  return fetchWithRetry_(url, options);
+
+}
+
+
+function fetchWithRetry_(url, options) {
+
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= DV3.API_RETRIES; attempt++) {
 
     try {
 
-      const result = performSearch_(query, location, apiKey, maxResults, minRating, minReviews,
-        leadsSheet, rawSheet, existingPlaceIds, budget);
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      const text = response.getContentText();
 
-      queueSheet.getRange(sheetRow, 8).setValue(new Date());
-      queueSheet.getRange(sheetRow, 9).setValue(result.stats.newLeads);
-      queueSheet.getRange(sheetRow, 10).setValue('OK');
+      if (code >= 200 && code < 300) return JSON.parse(text);
 
-      stats.queriesRun++;
-      stats.newLeads += result.stats.newLeads;
+      lastError = new Error('Places API ' + code + ': ' + text);
 
-      logRun_(query, result.stats, result.seconds, 'SUCCESS', 'Queue search completed', 'QUEUE');
+      if (code === 429 || code >= 500) {
+        Utilities.sleep(attempt * 1500);
+        continue;
+      }
+
+      throw lastError;
 
     } catch (error) {
 
-      queueSheet.getRange(sheetRow, 8).setValue(new Date());
-      queueSheet.getRange(sheetRow, 10).setValue('ERROR: ' + error.message);
-
-      logRun_(query, emptyStats_(), '0', 'FAILURE', String(error.message || error), 'QUEUE');
+      lastError = error;
+      if (attempt < DV3.API_RETRIES) Utilities.sleep(attempt * 1500);
 
     }
 
-  });
+  }
 
-  return stats;
+  throw lastError;
 
 }
 
 
-/***************************************************************
+/*****************************************************************
  * EXISTING LEAD REFRESH (Place Details lookup)
- ***************************************************************/
+ *****************************************************************/
 
-function refreshExistingLeads_(budget) {
+function refreshExistingLeadsNow() {
+
+  const apiKey = getPlacesAPIKey_();
+
+  if (!apiKey) {
+    SpreadsheetApp.getUi().alert('Set your Google Places API key first (DV INTELLIGENCE -> Set / Update API Key).');
+    return;
+  }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+
+  try {
+
+    const budget = { remaining: getMaxApiCallsPerRun_() };
+    const deadline = new Date().getTime() + DV3.MAX_RUN_MS;
+
+    const result = refreshExistingLeads_(budget, deadline);
+
+    SpreadsheetApp.getUi().alert(
+      'LEAD REFRESH COMPLETE\n\n' +
+      'Checked: ' + result.checked +
+      '\nUpdated: ' + result.updated +
+      '\nNewly Closed: ' + result.closed +
+      '\nNot Found (removed from Google): ' + result.notFound
+    );
+
+  } finally {
+
+    lock.releaseLock();
+
+  }
+
+}
+
+
+function refreshExistingLeads_(budget, deadline) {
 
   const ss = SpreadsheetApp.getActive();
-  const leadsSheet = ss.getSheetByName(DV.SHEETS.LEADS);
-  const apiKey = getAPIKey_();
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+  const apiKey = getPlacesAPIKey_();
 
   const stats = { checked: 0, updated: 0, closed: 0, notFound: 0 };
 
-  if (!apiKey || !leadsSheet) return stats;
+  if (!apiKey || !master) return stats;
 
-  const lastRow = leadsSheet.getLastRow();
+  const lastRow = master.getLastRow();
   if (lastRow <= 1) return stats;
 
   const numRows = lastRow - 1;
-  const numCols = DV.LEADS_HEADERS.length;
-  const data = leadsSheet.getRange(2, 1, numRows, numCols).getValues();
+  const numCols = DV3.MASTER_HEADERS.length;
+  const data = master.getRange(2, 1, numRows, numCols).getValues();
+
+  const idIdx = idxOf_('Google Place ID');
+  const statusIdx = idxOf_('Sales Status');
+  const refreshedIdx = idxOf_('Last Refreshed');
+  const groupIdx = idxOf_('Main Group');
+  const categoryIdx = idxOf_('DV Category');
+  const localityIdx = idxOf_('Search Locality');
 
   const candidates = data
     .map(function(row, i) {
       return {
         rowIndex: i + 2,
-        placeId: row[12],
-        status: row[20],
-        lastRefreshed: row[22] ? new Date(row[22]).getTime() : 0
+        placeId: row[idIdx],
+        status: row[statusIdx],
+        group: row[groupIdx],
+        category: row[categoryIdx],
+        locality: row[localityIdx],
+        lastRefreshed: row[refreshedIdx] ? new Date(row[refreshedIdx]).getTime() : 0
       };
     })
     .filter(function(c) { return c.placeId; })
@@ -854,17 +1116,20 @@ function refreshExistingLeads_(budget) {
   const perDayLimit = getLeadsToRefreshPerDay_();
   const toRefresh = candidates.slice(0, perDayLimit);
 
-  toRefresh.forEach(function(candidate) {
+  for (let i = 0; i < toRefresh.length; i++) {
 
-    if (budget && budget.remaining <= 0) return;
-    if (budget) budget.remaining--;
+    const candidate = toRefresh[i];
 
+    if (budget.remaining <= 0) break;
+    if (new Date().getTime() >= deadline) break;
+
+    budget.remaining--;
     stats.checked++;
 
     try {
 
-      const place = callPlaceDetails_(candidate.placeId, apiKey);
-      updateLeadRow_(leadsSheet, candidate.rowIndex, place, candidate.status);
+      const place = callPlaceDetailsAPI_(candidate.placeId, apiKey);
+      updateMasterRow_(master, candidate, place);
       stats.updated++;
 
       if (place.businessStatus === 'CLOSED_PERMANENTLY' || place.businessStatus === 'CLOSED_TEMPORARILY') {
@@ -873,198 +1138,482 @@ function refreshExistingLeads_(budget) {
 
     } catch (error) {
 
-      leadsSheet.getRange(candidate.rowIndex, 16).setValue('NOT FOUND');
-      leadsSheet.getRange(candidate.rowIndex, 23).setValue(new Date());
+      master.getRange(candidate.rowIndex, colOf_('Business Status')).setValue('NOT FOUND');
+      master.getRange(candidate.rowIndex, colOf_('Last Refreshed')).setValue(new Date());
       stats.notFound++;
 
     }
 
-  });
+  }
 
   return stats;
 
 }
 
 
-function updateLeadRow_(sheet, rowIndex, place, currentStatus) {
+function updateMasterRow_(sheet, candidate, place) {
 
   const rating = Number(place.rating || 0);
   const reviews = Number(place.userRatingCount || 0);
   const phone = place.nationalPhoneNumber || '';
   const internationalPhone = place.internationalPhoneNumber || '';
   const website = place.websiteUri || '';
-  const priceLevel = place.priceLevel || '';
   const businessStatus = place.businessStatus || '';
   const openingHours = extractOpeningHours_(place);
-  const leadScore = calculateLeadScore_(rating, reviews, website, phone, businessStatus);
 
-  sheet.getRange(rowIndex, 6).setValue(phone);
-  sheet.getRange(rowIndex, 7).setValue(internationalPhone);
-  sheet.getRange(rowIndex, 8).setValue(website);
-  sheet.getRange(rowIndex, 9).setValue(rating);
-  sheet.getRange(rowIndex, 10).setValue(reviews);
-  sheet.getRange(rowIndex, 11).setValue(priceLevel);
-  sheet.getRange(rowIndex, 16).setValue(businessStatus);
-  sheet.getRange(rowIndex, 17).setValue(openingHours);
-  sheet.getRange(rowIndex, 20).setValue(leadScore);
-  sheet.getRange(rowIndex, 23).setValue(new Date());
+  const score = calculateLeadScoreV3_(candidate.group, candidate.category, rating, reviews, website, phone, candidate.locality, businessStatus);
+  const priority = calculateLeadPriority_(score);
+  const contactability = calculateContactability_(website, phone);
 
-  // Only auto-flip Status to CLOSED if it's still in an automated state —
-  // never override a manual pipeline stage like CONTACTED / WON / LOST.
+  const row = candidate.rowIndex;
+
+  sheet.getRange(row, colOf_('Phone')).setValue(phone);
+  sheet.getRange(row, colOf_('International Phone')).setValue(internationalPhone);
+  sheet.getRange(row, colOf_('Website')).setValue(website);
+  sheet.getRange(row, colOf_('Google Rating')).setValue(rating || '');
+  sheet.getRange(row, colOf_('Google Reviews')).setValue(reviews || '');
+  sheet.getRange(row, colOf_('Price Level')).setValue(place.priceLevel || '');
+  sheet.getRange(row, colOf_('Business Status')).setValue(businessStatus);
+  sheet.getRange(row, colOf_('Opening Hours')).setValue(openingHours);
+  sheet.getRange(row, colOf_('Last Updated')).setValue(new Date());
+  sheet.getRange(row, colOf_('Lead Score')).setValue(score);
+  sheet.getRange(row, colOf_('Lead Priority')).setValue(priority);
+  sheet.getRange(row, colOf_('Contactability Score')).setValue(contactability);
+  sheet.getRange(row, colOf_('Last Refreshed')).setValue(new Date());
+
+  // Only auto-flip Sales Status to CLOSED if it's still in an automated
+  // state — never override a manual pipeline stage like CONTACTED / WON.
   if (businessStatus === 'CLOSED_PERMANENTLY' || businessStatus === 'CLOSED_TEMPORARILY') {
-    if (currentStatus === 'NEW' || currentStatus === 'CLOSED') {
-      sheet.getRange(rowIndex, 21).setValue('CLOSED');
+    if (candidate.status === 'NEW' || candidate.status === 'CLOSED') {
+      sheet.getRange(row, colOf_('Sales Status')).setValue('CLOSED');
     }
   }
 
 }
 
 
-/***************************************************************
- * RAW DATA CLEANUP
- ***************************************************************/
+/*****************************************************************
+ * APPEND MASTER / RAW
+ *****************************************************************/
+
+function appendMasterRows_(rows) {
+
+  if (!rows.length) return;
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.MASTER);
+
+  for (let i = 0; i < rows.length; i += DV3.WRITE_BATCH_SIZE) {
+    const batch = rows.slice(i, i + DV3.WRITE_BATCH_SIZE);
+    sh.getRange(sh.getLastRow() + 1, 1, batch.length, batch[0].length).setValues(batch);
+  }
+
+}
+
+
+function createRawSheet_(ss) {
+
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.RAW);
+
+  if (sh.getLastRow() > 1) return;
+
+  sh.clear();
+
+  sh.getRange(1, 1, 1, DV3.RAW_HEADERS.length)
+    .setValues([DV3.RAW_HEADERS])
+    .setFontWeight('bold');
+
+  sh.setFrozenRows(1);
+
+}
+
+
+function appendRawRows_(rows) {
+
+  if (!rows.length) return;
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.RAW);
+
+  sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+
+}
+
 
 function trimRawData_() {
 
   const ss = SpreadsheetApp.getActive();
-  const raw = ss.getSheetByName(DV.SHEETS.RAW);
+  const sh = ss.getSheetByName(DV3.SHEETS.RAW);
 
-  if (!raw) return;
+  if (!sh) return;
 
-  const maxRows = getMaxRawDataRows_();
-  const lastRow = raw.getLastRow();
-  const dataRows = lastRow - 1;
+  const maxRows = getMaxRawRows_();
+  const dataRows = sh.getLastRow() - 1;
 
   if (dataRows > maxRows) {
-    const excess = dataRows - maxRows;
-    raw.deleteRows(2, excess); // oldest rows are at the top
+    sh.deleteRows(2, dataRows - maxRows); // oldest rows are at the top
   }
 
 }
 
 
-/***************************************************************
- * GOOGLE PLACES API (with retry/backoff on transient errors)
- ***************************************************************/
+/*****************************************************************
+ * DEDUPLICATION
+ *****************************************************************/
 
-function fetchWithRetry_(url, options) {
+function getExistingPlaceIds_(master) {
 
-  const maxAttempts = 3;
-  let attempt = 0;
+  const set = new Set();
 
-  while (true) {
+  if (!master || master.getLastRow() <= 1) return set;
 
-    attempt++;
+  const values = master.getRange(2, colOf_('Google Place ID'), master.getLastRow() - 1, 1).getValues();
 
-    const response = UrlFetchApp.fetch(url, options);
-    const code = response.getResponseCode();
+  values.forEach(function(row) {
+    const id = String(row[0] || '').trim();
+    if (id) set.add(id);
+  });
 
-    if (code >= 200 && code < 300) return response;
+  return set;
 
-    const retryable = (code === 429 || code >= 500);
+}
 
-    if (retryable && attempt < maxAttempts) {
-      Utilities.sleep(1000 * Math.pow(2, attempt - 1));
-      continue;
+
+/*****************************************************************
+ * CATEGORY SHEETS — live QUERY() views, never overwritten data
+ *****************************************************************/
+
+function createCategorySheets_(ss) {
+
+  const names = [
+    DV3.SHEETS.FNB, DV3.SHEETS.FASHION, DV3.SHEETS.BEAUTY, DV3.SHEETS.REAL_ESTATE,
+    DV3.SHEETS.HEALTHCARE, DV3.SHEETS.EDUCATION, DV3.SHEETS.AUTOMOTIVE, DV3.SHEETS.OTHER
+  ];
+
+  names.forEach(function(name) { getOrCreateSheet_(ss, name); });
+
+}
+
+
+function refreshCategoryViews() {
+
+  const ss = SpreadsheetApp.getActive();
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+
+  if (!master) return;
+
+  const groupCol = columnToLetter_(colOf_('Main Group'));
+  const range = "'" + DV3.SHEETS.MASTER + "'!A:" + columnToLetter_(DV3.MASTER_HEADERS.length);
+
+  const mapping = {
+    'Food & Hospitality': DV3.SHEETS.FNB,
+    'Fashion & Retail': DV3.SHEETS.FASHION,
+    'Beauty & Wellness': DV3.SHEETS.BEAUTY,
+    'Real Estate': DV3.SHEETS.REAL_ESTATE,
+    'Healthcare': DV3.SHEETS.HEALTHCARE,
+    'Education': DV3.SHEETS.EDUCATION,
+    'Automotive': DV3.SHEETS.AUTOMOTIVE
+  };
+
+  const groups = Object.keys(mapping);
+
+  groups.forEach(function(group) {
+
+    const sh = ss.getSheetByName(mapping[group]);
+    if (!sh) return;
+
+    const formula = '=IFERROR(QUERY(' + range + ',"select * where ' + groupCol +
+      " = '" + group.replace(/'/g, "\\'") + '\'", 1), "No leads yet.")';
+
+    writeCategoryFormula_(sh, formula);
+
+  });
+
+  const otherSheet = ss.getSheetByName(DV3.SHEETS.OTHER);
+
+  if (otherSheet) {
+
+    const exclusions = groups.map(function(g) { return groupCol + " != '" + g.replace(/'/g, "\\'") + "'"; }).join(' and ');
+    const otherFormula = '=IFERROR(QUERY(' + range + ',"select * where ' + groupCol +
+      ' is not null and ' + exclusions + '", 1), "No leads yet.")';
+
+    writeCategoryFormula_(otherSheet, otherFormula);
+
+  }
+
+}
+
+
+function writeCategoryFormula_(sh, formula) {
+
+  sh.getRange(1, 1).setFormula(formula);
+  sh.getRange(1, 1).setNote(
+    'This is a live view of MASTER DATABASE — do not edit here.\n' +
+    'Update Sales Status / Notes / Assigned To in MASTER DATABASE\n' +
+    '(use its column filter to view one category at a time).'
+  );
+  sh.setFrozenRows(1);
+
+}
+
+
+/*****************************************************************
+ * COVERAGE
+ *****************************************************************/
+
+function createCoverageSheet_(ss) {
+
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.COVERAGE);
+
+  sh.clear();
+
+  sh.getRange(1, 1, 1, 10)
+    .setValues([[
+      'Main Group', 'Category', 'Total Leads', 'With Phone', 'Phone %',
+      'With Website', 'Website %', 'Hot Leads', 'High Leads', 'Last Updated'
+    ]])
+    .setFontWeight('bold');
+
+  sh.setFrozenRows(1);
+
+}
+
+
+function refreshCoverage() {
+
+  const ss = SpreadsheetApp.getActive();
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+  const coverage = ss.getSheetByName(DV3.SHEETS.COVERAGE);
+
+  if (!master || !coverage) return;
+  if (master.getLastRow() <= 1) return;
+
+  const data = master.getRange(2, 1, master.getLastRow() - 1, DV3.MASTER_HEADERS.length).getValues();
+
+  const groupIdx = idxOf_('Main Group');
+  const categoryIdx = idxOf_('DV Category');
+  const phoneIdx = idxOf_('Phone');
+  const websiteIdx = idxOf_('Website');
+  const priorityIdx = idxOf_('Lead Priority');
+
+  const stats = {};
+
+  data.forEach(function(row) {
+
+    const group = row[groupIdx];
+    const category = row[categoryIdx];
+    const key = group + '|' + category;
+
+    if (!stats[key]) {
+      stats[key] = { group: group, category: category, total: 0, phone: 0, website: 0, hot: 0, high: 0 };
     }
 
-    throw new Error('Google Places API Error ' + code + '\n\n' + response.getContentText());
+    const s = stats[key];
+    s.total++;
+    if (row[phoneIdx]) s.phone++;
+    if (row[websiteIdx]) s.website++;
+    if (row[priorityIdx] === 'HOT') s.hot++;
+    if (row[priorityIdx] === 'HIGH') s.high++;
+
+  });
+
+  const rows = Object.keys(stats).map(function(key) {
+    const s = stats[key];
+    return [
+      s.group, s.category, s.total, s.phone, s.total ? s.phone / s.total : 0,
+      s.website, s.total ? s.website / s.total : 0, s.hot, s.high, new Date()
+    ];
+  });
+
+  if (coverage.getLastRow() > 1) {
+    coverage.getRange(2, 1, coverage.getLastRow() - 1, coverage.getLastColumn()).clearContent();
+  }
+
+  if (rows.length) {
+    coverage.getRange(2, 1, rows.length, rows[0].length).setValues(rows);
+    coverage.getRange(2, 5, rows.length, 1).setNumberFormat('0.0%');
+    coverage.getRange(2, 7, rows.length, 1).setNumberFormat('0.0%');
+  }
+
+}
+
+
+/*****************************************************************
+ * RUN LOG
+ *****************************************************************/
+
+function createLogSheet_(ss) {
+
+  const sh = getOrCreateSheet_(ss, DV3.SHEETS.LOG);
+
+  if (sh.getLastRow() > 1) return;
+
+  sh.clear();
+
+  sh.getRange(1, 1, 1, DV3.LOG_HEADERS.length)
+    .setValues([DV3.LOG_HEADERS])
+    .setFontWeight('bold');
+
+  sh.setFrozenRows(1);
+
+}
+
+
+function logSystemRun_(type, searches, api, leads, duplicates, seconds, status, message) {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.LOG);
+
+  if (!sh) return;
+
+  sh.appendRow([new Date(), type, searches, api, leads, duplicates, seconds, status, message]);
+
+}
+
+
+/*****************************************************************
+ * RESET SEARCH QUEUE
+ *****************************************************************/
+
+function resetSearchQueue_() {
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(DV3.SHEETS.QUEUE);
+
+  if (!sh || sh.getLastRow() <= 1) return;
+
+  sh.getRange(2, 8, sh.getLastRow() - 1, 1).setValue('PENDING');
+
+}
+
+
+/*****************************************************************
+ * CONTROL STATS
+ *****************************************************************/
+
+function updateControlStats_() {
+
+  const ss = SpreadsheetApp.getActive();
+  const master = ss.getSheetByName(DV3.SHEETS.MASTER);
+  const queue = ss.getSheetByName(DV3.SHEETS.QUEUE);
+
+  const total = master ? Math.max(master.getLastRow() - 1, 0) : 0;
+
+  let remaining = 0;
+
+  if (queue && queue.getLastRow() > 1) {
+    const statuses = queue.getRange(2, 8, queue.getLastRow() - 1, 1).getValues();
+    statuses.forEach(function(row) {
+      if (row[0] === 'PENDING' || row[0] === 'RETRY') remaining++;
+    });
+  }
+
+  setControlValue_('Total Master Leads', total);
+  setControlValue_('Remaining Queue', remaining);
+
+  trimRawData_();
+
+}
+
+
+/*****************************************************************
+ * API KEY
+ *****************************************************************/
+
+function setPlacesAPIKey() {
+
+  const ui = SpreadsheetApp.getUi();
+
+  const response = ui.prompt(
+    'Google Places API Key',
+    'Paste your API key. It will be stored in Script Properties, not inside the sheet.',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const key = response.getResponseText().trim();
+
+  if (!key) {
+    ui.alert('API key cannot be blank.');
+    return;
+  }
+
+  PropertiesService.getScriptProperties().setProperty(DV3.API_KEY_PROPERTY, key);
+  ui.alert('API key saved securely.');
+
+}
+
+
+function getPlacesAPIKey_() {
+  return PropertiesService.getScriptProperties().getProperty(DV3.API_KEY_PROPERTY) || '';
+}
+
+
+/*****************************************************************
+ * TEST API
+ *****************************************************************/
+
+function testPlacesAPI() {
+
+  try {
+
+    const key = getPlacesAPIKey_();
+    if (!key) throw new Error('Set API key first.');
+
+    const response = callPlacesAPI_('cafes in Jubilee Hills, Hyderabad, Telangana', null, key);
+    const count = response.places ? response.places.length : 0;
+
+    SpreadsheetApp.getUi().alert('API SUCCESS\n\n' + count + ' businesses returned.');
+
+  } catch (error) {
+
+    SpreadsheetApp.getUi().alert('API TEST FAILED\n\n' + error.message);
 
   }
 
 }
 
 
-function callGooglePlaces_(query, apiKey, pageToken) {
+/*****************************************************************
+ * DAILY AUTOMATION
+ *****************************************************************/
 
-  const payload = {
-    textQuery: query,
-    languageCode: 'en',
-    regionCode: 'IN',
-    pageSize: 20
-  };
+function enableDailyAutomation() {
 
-  if (pageToken) payload.pageToken = pageToken;
+  disableDailyAutomation();
 
-  const options = {
-    method: 'post',
-    contentType: 'application/json',
-    headers: {
-      'X-Goog-Api-Key': apiKey,
-      'X-Goog-FieldMask': DV.SEARCH_FIELD_MASK
-    },
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true
-  };
+  const hour = getAutomationHour_();
 
-  const response = fetchWithRetry_(DV.SEARCH_ENDPOINT, options);
+  ScriptApp.newTrigger(DV3.DAILY_TRIGGER_HANDLER)
+    .timeBased()
+    .everyDays(1)
+    .atHour(hour)
+    .create();
 
-  return JSON.parse(response.getContentText());
+  setControlValue_('Daily Automation Enabled', 'TRUE');
+
+  SpreadsheetApp.getUi().alert('Daily automation enabled around ' + hour + ':00.');
 
 }
 
 
-function callPlaceDetails_(placeId, apiKey) {
+function disableDailyAutomation() {
 
-  const url = DV.DETAILS_ENDPOINT + encodeURIComponent(placeId);
+  ScriptApp.getProjectTriggers().forEach(function(trigger) {
+    if (trigger.getHandlerFunction() === DV3.DAILY_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
 
-  const options = {
-    method: 'get',
-    headers: {
-      'X-Goog-Api-Key': apiKey,
-      'X-Goog-FieldMask': DV.DETAILS_FIELD_MASK
-    },
-    muteHttpExceptions: true
-  };
-
-  const response = fetchWithRetry_(url, options);
-
-  return JSON.parse(response.getContentText());
+  setControlValue_('Daily Automation Enabled', 'FALSE');
 
 }
 
 
-/***************************************************************
- * LEAD SCORE
- ***************************************************************/
-
-function calculateLeadScore_(rating, reviews, website, phone, businessStatus) {
-
-  let score = 0;
-
-  // RATING — 30 POINTS
-  if (rating >= 4.5) score += 30;
-  else if (rating >= 4.2) score += 25;
-  else if (rating >= 4) score += 20;
-  else if (rating >= 3.5) score += 10;
-
-  // REVIEWS — 30 POINTS
-  if (reviews >= 5000) score += 30;
-  else if (reviews >= 1000) score += 25;
-  else if (reviews >= 500) score += 20;
-  else if (reviews >= 100) score += 15;
-  else if (reviews >= 25) score += 5;
-
-  // WEBSITE — 20 POINTS
-  if (website) score += 20;
-
-  // PHONE — 20 POINTS
-  if (phone) score += 20;
-
-  // A permanently closed business is not a sellable lead.
-  if (businessStatus === 'CLOSED_PERMANENTLY') return 0;
-
-  // A temporarily closed business is still worth half credit.
-  if (businessStatus === 'CLOSED_TEMPORARILY') return Math.round(score * 0.5);
-
-  return score;
-
-}
-
-
-/***************************************************************
+/*****************************************************************
  * OPENING HOURS
- ***************************************************************/
+ *****************************************************************/
 
 function extractOpeningHours_(place) {
 
@@ -1072,289 +1621,70 @@ function extractOpeningHours_(place) {
     if (place.regularOpeningHours && place.regularOpeningHours.weekdayDescriptions) {
       return place.regularOpeningHours.weekdayDescriptions.join(' | ');
     }
-  } catch (e) {
-    return '';
-  }
+  } catch (e) {}
 
   return '';
 
 }
 
 
-/***************************************************************
- * EXISTING PLACE IDS
- ***************************************************************/
-
-function getExistingPlaceIds_(sheet) {
-
-  const ids = new Set();
-  const lastRow = sheet.getLastRow();
-
-  if (lastRow <= 1) return ids;
-
-  const values = sheet.getRange(2, 13, lastRow - 1, 1).getValues();
-
-  values.forEach(function(row) {
-    const id = String(row[0]).trim();
-    if (id) ids.add(id);
-  });
-
-  return ids;
-
-}
-
-
-/***************************************************************
+/*****************************************************************
  * LEAD ID
- ***************************************************************/
+ *****************************************************************/
 
-function createLeadId_(placeId) {
+function createDVLeadId_(placeId) {
 
   if (placeId) {
-    return 'DV-' + placeId.substring(0, 12).toUpperCase();
+    return 'DV-' + placeId.replace(/[^a-zA-Z0-9]/g, '').substring(0, 14).toUpperCase();
   }
 
-  return 'DV-' + Utilities.getUuid().substring(0, 8).toUpperCase();
+  return 'DV-' + Utilities.getUuid().substring(0, 10).toUpperCase();
 
 }
 
 
-/***************************************************************
- * SETTINGS ACCESS
- ***************************************************************/
+/*****************************************************************
+ * COLUMN LOOKUP HELPERS
+ * Resolve Master Database columns by header name instead of magic
+ * numbers, so adding/reordering headers can't silently break scoring,
+ * dedup, coverage, or refresh.
+ *****************************************************************/
 
-function getSettingsMap_() {
-
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(DV.SHEETS.SETTINGS);
-  const map = {};
-
-  if (!sh) return map;
-
-  const lastRow = sh.getLastRow();
-  if (lastRow === 0) return map;
-
-  const values = sh.getRange(1, 1, lastRow, 2).getValues();
-
-  values.forEach(function(row) {
-    const key = String(row[0]).trim();
-    if (key) map[key] = row[1];
-  });
-
-  return map;
-
+function colOf_(headerName) {
+  const idx = DV3.MASTER_HEADERS.indexOf(headerName);
+  if (idx === -1) throw new Error('Unknown MASTER DATABASE column: ' + headerName);
+  return idx + 1;
 }
 
 
-function setSettingValue_(label, value) {
+function idxOf_(headerName) {
+  return colOf_(headerName) - 1;
+}
 
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(DV.SHEETS.SETTINGS);
 
-  if (!sh) return;
-
-  const lastRow = sh.getLastRow();
-
-  const labels = sh.getRange(1, 1, lastRow, 1)
-    .getValues()
-    .map(function(r) { return String(r[0]).trim(); });
-
-  const idx = labels.indexOf(label);
-
-  if (idx !== -1) {
-    sh.getRange(idx + 1, 2).setValue(value);
+function columnToLetter_(column) {
+  let temp, letter = '';
+  while (column > 0) {
+    temp = (column - 1) % 26;
+    letter = String.fromCharCode(temp + 65) + letter;
+    column = (column - temp - 1) / 26;
   }
-
+  return letter;
 }
 
 
-function getAPIKey_() {
-
-  const stored = PropertiesService.getScriptProperties().getProperty(DV.API_KEY_PROPERTY);
-  if (stored) return stored;
-
-  const map = getSettingsMap_();
-  const key = String(map['Google Places API Key'] || '').trim();
-
-  if (!key || key === 'PASTE_API_KEY_HERE' || key.indexOf('STORED SECURELY') !== -1) {
-    return null;
-  }
-
-  return key;
-
-}
-
-
-function saveApiKeySecurely() {
-
-  const map = getSettingsMap_();
-  const key = String(map['Google Places API Key'] || '').trim();
-
-  if (!key || key === 'PASTE_API_KEY_HERE' || key.indexOf('STORED SECURELY') !== -1) {
-    SpreadsheetApp.getUi().alert('Paste a real API key into SETTINGS → Google Places API Key first.');
-    return;
-  }
-
-  PropertiesService.getScriptProperties().setProperty(DV.API_KEY_PROPERTY, key);
-  setSettingValue_('Google Places API Key', '•••• STORED SECURELY (Script Properties) ••••');
-
-  SpreadsheetApp.getUi().alert(
-    'API key saved securely.\n\n' +
-    'It is now stored in Script Properties instead of the sheet, so it will no ' +
-    'longer be visible to anyone with view access to this spreadsheet.'
-  );
-
-}
-
-
-function getMaxPagesPerSearch_() {
-  const map = getSettingsMap_();
-  const raw = Number(map['Maximum Pages Per Search']) || DV.HARD_MAX_PAGES;
-  return Math.max(1, Math.min(raw, DV.HARD_MAX_PAGES));
-}
-
-
-function getLeadsToRefreshPerDay_() {
-  const map = getSettingsMap_();
-  return Math.max(0, Number(map['Leads To Refresh Per Day']) || 50);
-}
-
-
-function getMaxDailyApiCalls_() {
-  const map = getSettingsMap_();
-  return Math.max(1, Number(map['Max Daily API Calls']) || 150);
-}
-
-
-function getMaxRawDataRows_() {
-  const map = getSettingsMap_();
-  return Math.max(100, Number(map['Max Raw Data Rows']) || 5000);
-}
-
-
-function getDailyRunHour_() {
-  const map = getSettingsMap_();
-  const hour = Number(map['Daily Auto-Run Hour (0-23)']);
-  if (isNaN(hour) || hour < 0 || hour > 23) return 6;
-  return hour;
-}
-
-
-/***************************************************************
- * LOGGING
- ***************************************************************/
-
-function emptyStats_() {
-  return { apiResults: 0, passed: 0, newLeads: 0, duplicates: 0, rejectedRating: 0, rejectedReviews: 0 };
-}
-
-
-function logRun_(query, stats, seconds, status, message, runType) {
-
-  const ss = SpreadsheetApp.getActive();
-  const log = ss.getSheetByName(DV.SHEETS.LOG);
-
-  if (!log) return;
-
-  log.appendRow([
-    new Date(), query, stats.apiResults, stats.passed, stats.newLeads, stats.duplicates,
-    stats.rejectedRating, stats.rejectedReviews, seconds, status, message, runType || 'MANUAL'
-  ]);
-
-}
-
-
-function logDailyRun_(queueStats, refreshStats, seconds) {
-
-  const ss = SpreadsheetApp.getActive();
-  const log = ss.getSheetByName(DV.SHEETS.LOG);
-
-  if (!log) return;
-
-  const message =
-    'New leads: ' + queueStats.newLeads +
-    ' | Refreshed: ' + refreshStats.updated +
-    ' | Newly Closed: ' + refreshStats.closed +
-    ' | Not Found: ' + refreshStats.notFound;
-
-  log.appendRow([
-    new Date(),
-    'DAILY AUTO-REFINEMENT (' + queueStats.queriesRun + ' queries, ' + refreshStats.checked + ' leads checked)',
-    0, 0, queueStats.newLeads, 0, 0, 0,
-    seconds, 'SUCCESS', message, 'AUTO'
-  ]);
-
-}
-
-
-/***************************************************************
- * CLEAR LEADS
- ***************************************************************/
-
-function clearLeadResults() {
-
-  const ss = SpreadsheetApp.getActive();
-  const leads = ss.getSheetByName(DV.SHEETS.LEADS);
-  const raw = ss.getSheetByName(DV.SHEETS.RAW);
-
-  if (leads && leads.getLastRow() > 1) {
-    leads.getRange(2, 1, leads.getLastRow() - 1, leads.getLastColumn()).clearContent();
-  }
-
-  if (raw && raw.getLastRow() > 1) {
-    raw.getRange(2, 1, raw.getLastRow() - 1, raw.getLastColumn()).clearContent();
-  }
-
-  SpreadsheetApp.getUi().alert('Lead results cleared.');
-
-}
-
-
-/***************************************************************
- * API TEST
- ***************************************************************/
-
-function testAPIConnection() {
-
-  const apiKey = getAPIKey_();
-
-  if (!apiKey) {
-    SpreadsheetApp.getUi().alert(
-      'API key missing.\n\nAdd it in SETTINGS → Google Places API Key.'
-    );
-    return;
-  }
-
-  try {
-
-    const result = callGooglePlaces_('restaurants in Hyderabad Telangana', apiKey, null);
-    const count = result.places ? result.places.length : 0;
-
-    SpreadsheetApp.getUi().alert(
-      'API CONNECTION SUCCESSFUL\n\nGoogle returned ' + count + ' businesses.'
-    );
-
-  } catch (error) {
-
-    SpreadsheetApp.getUi().alert('API CONNECTION FAILED\n\n' + error.message);
-
-  }
-
-}
-
-
-/***************************************************************
- * HELPER
- ***************************************************************/
+/*****************************************************************
+ * SHEET HELPER
+ *****************************************************************/
 
 function getOrCreateSheet_(ss, name) {
 
-  let sheet = ss.getSheetByName(name);
+  let sh = ss.getSheetByName(name);
 
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
   }
 
-  return sheet;
+  return sh;
 
 }
