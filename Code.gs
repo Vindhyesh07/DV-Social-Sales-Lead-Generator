@@ -1843,31 +1843,127 @@ function getOrCreateSheet_(ss, name) {
 function createDashboardSheet_(ss) {
 
   const sh = getOrCreateSheet_(ss, DV3.SHEETS.DASHBOARD);
+  const isNew = sh.getLastRow() === 0;
 
-  if (sh.getLastRow() > 0) return;
+  if (isNew) {
 
-  sh.getRange('A1:I1').merge().setValue('DV SOCIAL — SALES LEAD DASHBOARD')
-    .setFontSize(20).setFontWeight('bold').setHorizontalAlignment('center');
+    sh.getRange('A3').setValue('GENERATE FRESH LEADS');
+    sh.getRange(DV3.DASHBOARD_RUN_CELL).insertCheckboxes().setValue(false);
 
-  sh.getRange('A3').setValue('GENERATE FRESH LEADS');
-  sh.getRange(DV3.DASHBOARD_RUN_CELL).insertCheckboxes().setValue(false);
+    sh.getRange('C3').setValue('REFRESH EXISTING DATA');
+    sh.getRange(DV3.DASHBOARD_REFRESH_CELL).insertCheckboxes().setValue(false);
 
-  sh.getRange('C3').setValue('REFRESH EXISTING DATA');
-  sh.getRange(DV3.DASHBOARD_REFRESH_CELL).insertCheckboxes().setValue(false);
+    sh.getRange('E3').setValue('VERIFY F&B');
+    sh.getRange(DV3.DASHBOARD_VERIFY_CELL).insertCheckboxes().setValue(false);
 
-  sh.getRange('E3').setValue('VERIFY F&B');
-  sh.getRange(DV3.DASHBOARD_VERIFY_CELL).insertCheckboxes().setValue(false);
+    sh.getRange('A5:I5').setValues([[
+      'Total Leads', 'Active Leads', 'New Today', 'Phone Available', 'Website Available',
+      'HOT', 'HIGH', 'Refreshed Today', 'F&B Verified'
+    ]]);
 
-  sh.getRange('A5:I5').setValues([[
-    'Total Leads', 'Active Leads', 'New Today', 'Phone Available', 'Website Available',
-    'HOT', 'HIGH', 'Refreshed Today', 'F&B Verified'
-  ]]).setFontWeight('bold');
+    sh.getRange('A8:D8').setValues([['Category', 'Total', 'With Phone', 'HOT + HIGH']]);
+    sh.getRange('F8:H8').setValues([['Locality', 'Total', 'New Today']]);
 
-  sh.getRange('A8:D8').setValues([['Category', 'Total', 'With Phone', 'HOT + HIGH']]).setFontWeight('bold');
-  sh.getRange('F8:H8').setValues([['Locality', 'Total', 'New Today']]).setFontWeight('bold');
+    sh.setFrozenRows(3);
+    sh.setColumnWidths(1, 9, 145);
 
-  sh.setFrozenRows(3);
-  sh.setColumnWidths(1, 9, 145);
+  }
+
+  sh.getRange('A1:I1').merge().setValue('DV SOCIAL — SALES LEAD DASHBOARD');
+  sh.getRange('A2:I2').merge();
+
+  styleDashboardSheet_(sh);
+
+}
+
+
+/**
+ * Visual layer for the Dashboard sheet, safe to re-apply any time (e.g. every
+ * "Setup / Update V3 System" run) without touching data or checkbox state.
+ * Hierarchy/color/spacing choices follow Apple's fluid-interface principles
+ * (purposeful color, direct affordance, craft, clarity through hierarchy
+ * rather than raw minimalism) translated to what Sheets formatting can do.
+ */
+function styleDashboardSheet_(sh) {
+
+  const COLOR = {
+    ink: '#14213D',
+    tableHead: '#20304F',
+    surface: '#F5F6FA',
+    card: '#FFFFFF',
+    border: '#D9DCE3',
+    subtitle: '#8A8F98',
+    run: '#2E6F40',
+    refresh: '#1D4E89',
+    verify: '#B8541D',
+    hot: '#FDECEA',
+    hotText: '#C0392B',
+    high: '#FEF6E7',
+    highText: '#B9770E'
+  };
+
+  sh.setHiddenGridlines(true);
+  sh.setRowHeight(1, 44);
+  sh.setRowHeight(2, 20);
+  sh.setRowHeight(3, 34);
+
+  sh.getRange('A1:I1')
+    .setBackground(COLOR.ink).setFontColor('#FFFFFF')
+    .setFontSize(18).setFontWeight('bold')
+    .setHorizontalAlignment('center').setVerticalAlignment('middle');
+
+  sh.getRange('A2:I2')
+    .setFontColor(COLOR.subtitle).setFontStyle('italic').setFontSize(9)
+    .setHorizontalAlignment('center');
+
+  // Action buttons: distinct colors give each control a direct, unambiguous
+  // affordance instead of three identical grey checkboxes.
+  [['A3:B3', COLOR.run], ['C3:D3', COLOR.refresh], ['E3:F3', COLOR.verify]].forEach(function(b) {
+    sh.getRange(b[0])
+      .setBackground(b[1]).setFontColor('#FFFFFF').setFontWeight('bold')
+      .setHorizontalAlignment('center').setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true, '#FFFFFF', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  });
+  sh.getRange('G3:I3').setBackground(COLOR.surface);
+
+  // Stat cards: headline numbers get real weight; HOT/HIGH get tinted
+  // backgrounds so priority reads instantly, not just from the label.
+  sh.getRange('A5:I5')
+    .setBackground(COLOR.tableHead).setFontColor('#FFFFFF').setFontWeight('bold').setFontSize(9)
+    .setHorizontalAlignment('center');
+  sh.getRange('A6:I6')
+    .setBackground(COLOR.card).setFontSize(20).setFontWeight('bold').setHorizontalAlignment('center')
+    .setBorder(true, true, true, true, true, true, COLOR.border, SpreadsheetApp.BorderStyle.SOLID);
+  sh.getRange('F6').setBackground(COLOR.hot).setFontColor(COLOR.hotText);
+  sh.getRange('G6').setBackground(COLOR.high).setFontColor(COLOR.highText);
+
+  sh.getRange('A8:D8').setBackground(COLOR.tableHead).setFontColor('#FFFFFF').setFontWeight('bold');
+  sh.getRange('F8:H8').setBackground(COLOR.tableHead).setFontColor('#FFFFFF').setFontWeight('bold');
+
+  [sh.getRange('A9:D40'), sh.getRange('F9:H40')].forEach(function(r) {
+    r.getBandings().forEach(function(bd) { bd.remove(); });
+    r.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY, false, false);
+  });
+
+  // Color intensity (depth, not just numbers) shows where the strongest
+  // leads and freshest activity concentrate at a glance.
+  sh.clearConditionalFormatRules();
+  sh.setConditionalFormatRules([
+    SpreadsheetApp.newConditionalFormatRule()
+      .setGradientMinpoint('#FFFFFF')
+      .setGradientMidpointWithValue('#F5CBA7', SpreadsheetApp.InterpolationType.PERCENT, 50)
+      .setGradientMaxpoint('#C0392B')
+      .setRanges([sh.getRange('D9:D40')])
+      .build(),
+    SpreadsheetApp.newConditionalFormatRule()
+      .setGradientMinpoint('#FFFFFF')
+      .setGradientMidpointWithValue('#AED6F1', SpreadsheetApp.InterpolationType.PERCENT, 50)
+      .setGradientMaxpoint('#1D4E89')
+      .setRanges([sh.getRange('H9:H40')])
+      .build()
+  ]);
+
+  sh.getRange('A1:I40').setBorder(true, true, true, true, false, false, COLOR.border, SpreadsheetApp.BorderStyle.SOLID);
 
 }
 
@@ -1930,6 +2026,10 @@ function refreshDashboard() {
   });
 
   sh.getRange('A6:I6').setValues([[total, active, newToday, phone, website, hot, high, refreshedToday, fnbVerified]]);
+
+  sh.getRange('A2').setValue(
+    'Last updated ' + Utilities.formatDate(today, Session.getScriptTimeZone(), 'MMM d, yyyy \'at\' h:mm a')
+  );
 
   const catRows = Object.keys(cats).map(function(k) { return [k, cats[k].total, cats[k].phone, cats[k].strong]; })
     .sort(function(a, b) { return b[1] - a[1]; }).slice(0, 20);
