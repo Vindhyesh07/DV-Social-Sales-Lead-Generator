@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DV Social — Launching Soon</title>
+<meta name="description" content="DV Social's new avatar is coming — meme marketing, brand social, performance ads and creator network, all in one place.">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+
+<style>
+  :root {
+    --ink: #0a0a0a;
+    --cream: #F5F1E8;
+    --yellow: #FFC700;
+    --pink: #FF2E7E;
+    --blue: #3D6BFF;
+    --lime: #B6FF3C;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ink);
+    font-family: 'Inter', sans-serif;
+    color: var(--cream);
+  }
+
+  a { color: var(--yellow); }
+  a:hover { color: var(--pink); }
+
+  @keyframes marquee-left { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+  @keyframes marquee-right { from { transform: translateX(-50%); } to { transform: translateX(0); } }
+  @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @keyframes float-badge {
+    0%, 100% { transform: translateY(-50%) rotate(var(--rot, 0deg)); }
+    50% { transform: translateY(calc(-50% - 10px)) rotate(var(--rot, 0deg)); }
+  }
+
+  /* background layer */
+  .bg {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    z-index: 0;
+    pointer-events: none;
+  }
+  .bg-grid {
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    background-size: 56px 56px;
+  }
+  .bg-glow-pink {
+    position: absolute;
+    width: 900px;
+    height: 900px;
+    border-radius: 50%;
+    top: -320px;
+    right: -280px;
+    background: radial-gradient(circle at 50% 50%, rgba(255, 46, 126, 0.35), rgba(255, 46, 126, 0) 65%);
+    filter: blur(10px);
+    transition: background-position 0.6s ease-out;
+    background-position: 62% 30%;
+  }
+  .bg-glow-blue {
+    position: absolute;
+    width: 600px;
+    height: 600px;
+    border-radius: 50%;
+    bottom: -260px;
+    left: -200px;
+    background: radial-gradient(circle at 50% 50%, rgba(61, 107, 255, 0.22), rgba(61, 107, 255, 0) 65%);
+    filter: blur(10px);
+  }
+
+  /* page */
+  #page {
+    position: relative;
+    z-index: 1;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 28px 48px;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .brand-mark {
+    width: 38px;
+    height: 38px;
+    background: var(--yellow);
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'Anton', sans-serif;
+    font-size: 18px;
+    color: var(--ink);
+  }
+  .brand-name {
+    font-weight: 800;
+    font-size: 18px;
+    letter-spacing: -0.02em;
+  }
+  .pill {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    border: 1px solid rgba(245, 241, 232, 0.3);
+    border-radius: 20px;
+    padding: 4px 10px;
+    color: rgba(245, 241, 232, 0.75);
+  }
+  .pill-status {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    padding: 8px 16px;
+    border: 1px solid rgba(255, 199, 0, 0.5);
+    border-radius: 20px;
+    color: var(--yellow);
+  }
+
+  /* hero */
+  .hero {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 40px 24px 80px;
+    position: relative;
+  }
+  .status-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    color: rgba(245, 241, 232, 0.6);
+    margin-bottom: 28px;
+  }
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--lime);
+    display: inline-block;
+    animation: pulse-dot 1.8s ease-in-out infinite;
+  }
+
+  .headline-wrap {
+    position: relative;
+    margin-bottom: 16px;
+  }
+  .headline {
+    font-family: 'Anton', sans-serif;
+    font-size: clamp(56px, 11vw, 150px);
+    line-height: 0.92;
+    color: var(--cream);
+    letter-spacing: -0.01em;
+  }
+  .headline.accent {
+    color: var(--yellow);
+    position: relative;
+    display: inline-block;
+  }
+  .headline.accent .dot { color: var(--pink); }
+
+  .badge {
+    position: absolute;
+    top: 50%;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 12px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    white-space: nowrap;
+    animation: float-badge 4.5s ease-in-out infinite;
+  }
+  .badge-left {
+    right: 100%;
+    margin-right: 28px;
+    transform: translateY(-50%) rotate(-8deg);
+    --rot: -8deg;
+    background: var(--lime);
+    color: var(--ink);
+  }
+  .badge-right {
+    left: 100%;
+    margin-left: 28px;
+    transform: translateY(-50%) rotate(6deg);
+    --rot: 6deg;
+    background: var(--blue);
+    color: var(--cream);
+    animation-duration: 5.2s;
+    animation-delay: 0.4s;
+  }
+
+  .copy {
+    max-width: 680px;
+    margin-top: 20px;
+  }
+  .copy-lead {
+    font-size: clamp(18px, 2.4vw, 26px);
+    font-weight: 700;
+    line-height: 1.4;
+    margin: 0;
+  }
+  .copy-lead .accent { color: var(--pink); }
+  .copy-sub {
+    font-size: 16px;
+    color: rgba(245, 241, 232, 0.6);
+    line-height: 1.6;
+    margin: 16px 0 0;
+  }
+
+  #successMsg {
+    display: none;
+    margin-top: 36px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+    color: var(--lime);
+    padding: 14px 24px;
+    border: 1px solid rgba(182, 255, 60, 0.4);
+    border-radius: 30px;
+  }
+
+  #notifyForm {
+    margin-top: 36px;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  #emailInput {
+    background: rgba(245, 241, 232, 0.06);
+    border: 1px solid rgba(245, 241, 232, 0.2);
+    border-radius: 30px;
+    padding: 14px 22px;
+    font-family: 'Inter', sans-serif;
+    font-size: 15px;
+    color: var(--cream);
+    width: 280px;
+    outline: none;
+  }
+  #notifyForm button {
+    background: var(--yellow);
+    color: var(--ink);
+    border: none;
+    border-radius: 30px;
+    padding: 14px 28px;
+    font-family: 'Inter', sans-serif;
+    font-weight: 800;
+    font-size: 15px;
+    cursor: pointer;
+    transition: background 0.2s ease, color 0.2s ease;
+  }
+  #notifyForm button:hover {
+    background: var(--pink);
+    color: var(--cream);
+  }
+
+  /* marquees */
+  .marquee-row { overflow: hidden; }
+  .marquee-row.yellow { background: var(--yellow); }
+  .marquee-row.pink { background: var(--pink); }
+  .marquee-track {
+    display: flex;
+    width: max-content;
+    white-space: nowrap;
+  }
+  .marquee-track.left { animation: marquee-left 26s linear infinite; }
+  .marquee-track.right { animation: marquee-right 30s linear infinite; }
+  .marquee-text-big {
+    font-family: 'Anton', sans-serif;
+    font-size: 26px;
+    color: var(--ink);
+    padding: 14px 0;
+    display: flex;
+    align-items: center;
+    gap: 32px;
+  }
+  .marquee-text-small {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    color: var(--ink);
+    padding: 12px 0;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+
+  .footer {
+    text-align: center;
+    padding: 24px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: rgba(245, 241, 232, 0.4);
+  }
+
+  @media (max-width: 720px) {
+    .badge { display: none; }
+    .header { padding: 20px 24px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bg">
+  <div class="bg-grid"></div>
+  <div id="glow1" class="bg-glow-pink"></div>
+  <div class="bg-glow-blue"></div>
+</div>
+
+<div id="page">
+
+  <header class="header">
+    <div class="brand">
+      <div class="brand-mark">DV</div>
+      <span class="brand-name">DV Social</span>
+      <span class="pill">SOCIAL-FIRST</span>
+    </div>
+    <div class="pill-status">COMING SOON</div>
+  </header>
+
+  <main class="hero">
+
+    <div class="status-line">
+      <span class="status-dot"></span>
+      SYSTEMS WARMING UP · LAUNCHING SOON
+    </div>
+
+    <div class="headline-wrap">
+      <div class="headline">LAUNCHING</div>
+      <div class="headline accent">
+        SOON<span class="dot">.</span>
+      </div>
+
+      <div class="badge badge-left">500+ memes ready →</div>
+      <div class="badge badge-right">100 Cr+ views incoming</div>
+    </div>
+
+    <div class="copy">
+      <p class="copy-lead">
+        Trailer toh dekh liya na? Ab <span class="accent">asli picture</span> ka wait karo.
+      </p>
+      <p class="copy-sub">
+        DV Social ka naya avatar aa raha hai — memes, marketing aur thoda drama, sab ek saath.
+      </p>
+    </div>
+
+    <div id="successMsg">
+      Ho gaya! Hum bata denge jaise hi launch ho jaaye.
+    </div>
+    <form id="notifyForm">
+      <input type="email" required id="emailInput" placeholder="apna email daalo">
+      <button type="submit">Notify Me →</button>
+    </form>
+
+  </main>
+
+  <div>
+    <div class="marquee-row yellow">
+      <div class="marquee-track left">
+        <span class="marquee-text-big">
+          MEME MARKETING ✦ BRAND SOCIAL ✦ PERFORMANCE ADS ✦ CREATOR NETWORK ✦ ORM ✦ MEME MARKETING ✦ BRAND SOCIAL ✦ PERFORMANCE ADS ✦ CREATOR NETWORK ✦ ORM ✦
+        </span>
+      </div>
+    </div>
+    <div class="marquee-row pink">
+      <div class="marquee-track right">
+        <span class="marquee-text-small">
+          BAS THODA SABR ● TAYYARI HO RAHI HAI ● PICTURE ABHI BAAKI HAI ● DHAMAKA HONE WALA HAI ● JALD HI ● BAS THODA SABR ● TAYYARI HO RAHI HAI ● PICTURE ABHI BAAKI HAI ● DHAMAKA HONE WALA HAI ● JALD HI ●
+        </span>
+      </div>
+    </div>
+  </div>
+
+  <footer class="footer">
+    © DV Social — social-first marketing agency
+  </footer>
+</div>
+
+<script>
+  var ticking = false;
+  document.getElementById('page').addEventListener('mousemove', function (e) {
+    if (ticking) return;
+    ticking = true;
+    var x = (e.clientX / window.innerWidth) * 100;
+    var y = (e.clientY / window.innerHeight) * 100;
+    requestAnimationFrame(function () {
+      document.getElementById('glow1').style.backgroundPosition = x + '% ' + y + '%';
+      ticking = false;
+    });
+  });
+
+  document.getElementById('notifyForm').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var email = document.getElementById('emailInput').value.trim();
+    if (email.length > 3) {
+      document.getElementById('notifyForm').style.display = 'none';
+      document.getElementById('successMsg').style.display = 'block';
+    }
+  });
+</script>
+
+</body>
+</html>
